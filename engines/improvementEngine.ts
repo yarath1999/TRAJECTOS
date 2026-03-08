@@ -35,7 +35,7 @@ export function generateImprovements(
         );
 
   // Step 2: Simulate improvements
-  // A) Savings increase
+  // A) Savings increase (10% bump)
   const simulateSavings = inputs.monthlySavings * 1.1;
   const yearsSavings = solveForN(
     inputs.currentSavings,
@@ -46,7 +46,7 @@ export function generateImprovements(
   const monthsSavedSavings = Math.round((baselineYears - yearsSavings) * 12);
   const savingsDelta = Math.round(simulateSavings - inputs.monthlySavings);
 
-  // B) Return increase
+  // B) Return increase (+0.5%)
   const simulateReturn = inputs.expectedReturn + 0.005;
   const yearsReturn = solveForN(
     inputs.currentSavings,
@@ -56,7 +56,7 @@ export function generateImprovements(
   );
   const monthsSavedReturn = Math.round((baselineYears - yearsReturn) * 12);
 
-  // C) Timeline extension
+  // C) Timeline extension (+2 years)
   const simulateTimeline = inputs.timeHorizon + 2;
   const fvExtended = futureValue(
     inputs.currentSavings,

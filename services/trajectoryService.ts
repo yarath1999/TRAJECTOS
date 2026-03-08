@@ -1,12 +1,15 @@
 import { futureValue } from "@/lib/finance";
-import { generateImprovements, type ImprovementSuggestion } from "@/lib/improvementEngine";
+import {
+  generateImprovements,
+  type ImprovementSuggestion,
+} from "@/engines/improvementEngine";
 import {
   classifyTrajectory,
   detectTrajectoryCause,
   type TrajectoryCause,
   type TrajectoryInsight,
-} from "@/lib/insights";
-import { getReturnInsight, type ReturnInsight } from "@/lib/returnInsight";
+} from "@/engines/insightEngine";
+import { getReturnInsight, type ReturnInsight } from "@/engines/returnInsightEngine";
 import { marketScenarios } from "@/simulation/marketScenarios";
 import {
   runScenarios,

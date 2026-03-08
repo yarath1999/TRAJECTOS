@@ -1,4 +1,4 @@
-import type { ImprovementSuggestion } from "@/lib/improvementEngine";
+import type { ImprovementSuggestion } from "@/engines/improvementEngine";
 
 export default function ImprovementSuggestions({
   suggestions,
