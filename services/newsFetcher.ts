@@ -7,6 +7,7 @@ type MacroEventRow = {
   title: string;
   description: string;
   source: string;
+  url: string;
   published_at: string;
   category: string;
   geography?: string | null;
@@ -108,9 +109,14 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
   const sources = await getActiveEventSources(supabase);
   const parser = new Parser({
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; Trajectos Macro Intelligence Bot)",
+      "User-Agent": "Mozilla/5.0 (Trajectos Macro Intelligence Engine)",
     },
     timeout: 15000,
+    xml2js: {
+      normalize: true,
+      normalizeTags: true,
+      explicitArray: false,
+    },
   });
 
   let sourcesProcessed = 0;
@@ -127,6 +133,7 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
       const category = (src.category ?? "unknown").toString();
 
       const rows: MacroEventRow[] = [];
+      const seenUrls = new Set<string>();
 
       const items = Array.isArray(feed.items) ? feed.items : [];
 
@@ -136,6 +143,9 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
           .toString()
           .trim();
         const link = (item.link ?? item.guid ?? "").toString().trim();
+
+        if (link && seenUrls.has(link)) continue;
+        if (link) seenUrls.add(link);
 
         if (!title) continue;
 
@@ -149,6 +159,7 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
           title,
           description,
           source: sourceLabel,
+          url: link,
           published_at: new Date(timestamp).toISOString(),
           category,
           geography: null,
@@ -173,7 +184,11 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
       articlesInserted += data?.length ?? rows.length;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`Source failed (${src.name}):`, message);
+      console.error("Feed error", {
+        source: src.name,
+        url: src.rss_url,
+        error: message,
+      });
       continue;
     }
   }
