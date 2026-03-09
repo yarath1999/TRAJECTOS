@@ -7,7 +7,7 @@ type MacroEventRow = {
   title: string;
   description: string;
   source: string;
-  timestamp: number;
+  published_at: string;
   category: string;
   geography?: string | null;
   industries?: string[] | null;
@@ -43,6 +43,8 @@ function createSupabaseServerClient(): SupabaseClient {
       "Missing Supabase key. Set SUPABASE_SERVICE_ROLE_KEY (recommended) or NEXT_PUBLIC_SUPABASE_ANON_KEY.",
     );
   }
+  console.log("Using key type:",
+  process.env.SUPABASE_SERVICE_ROLE_KEY ? "service_role" : "anon");
 
   return createClient(url, key, {
     auth: {
@@ -104,7 +106,12 @@ export type FetchAndStoreNewsResult = {
 export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
   const supabase = createSupabaseServerClient();
   const sources = await getActiveEventSources(supabase);
-  const parser = new Parser();
+  const parser = new Parser({
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; Trajectos Macro Intelligence Bot)",
+    },
+    timeout: 15000,
+  });
 
   let sourcesProcessed = 0;
   let articlesInserted = 0;
@@ -121,7 +128,9 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
 
       const rows: MacroEventRow[] = [];
 
-      for (const item of feed.items ?? []) {
+      const items = Array.isArray(feed.items) ? feed.items : [];
+
+      for (const item of items) {
         const title = (item.title ?? "").toString().trim();
         const description = (item.contentSnippet ?? item.content ?? "")
           .toString()
@@ -140,7 +149,7 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
           title,
           description,
           source: sourceLabel,
-          timestamp,
+          published_at: new Date(timestamp).toISOString(),
           category,
           geography: null,
           industries: null,
