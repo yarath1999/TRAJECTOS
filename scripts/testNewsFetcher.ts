@@ -1,10 +1,9 @@
 import { loadEnvConfig } from "@next/env";
 import { fetchAndStoreNews } from "@/services/newsFetcher";
 
-async function main(): Promise<void> {
-  // Load .env.local / .env (Next.js-style) for local scripts.
-  loadEnvConfig(process.cwd());
+loadEnvConfig(process.cwd());
 
+async function main(): Promise<void> {
   console.log("Starting RSS ingestion test...");
 
   const result = await fetchAndStoreNews();

@@ -1,15 +1,17 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { createHash } from "node:crypto";
 import Parser from "rss-parser";
+import { normalizeFeedItem } from "@/lib/feedNormalizer";
+import { extractArticleContent } from "@/lib/articleExtractor";
+
+const BATCH_SIZE = 50;
+let batchBuffer: any[] = [];
 
 type MacroEventRow = {
-  id: string;
   title: string;
   description: string;
   source: string;
   url: string;
   published_at: string;
-  ingested_at: string;
   processed: boolean;
   category: string;
   geography?: string | null;
@@ -27,6 +29,57 @@ type EventSourceRow = {
   error_count?: number | null;
 };
 
+function isDuplicateUrlConstraintError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("duplicate key value") &&
+    (
+      m.includes("event_queue_url_key") ||
+      m.includes("macro_events_raw_url_key") ||
+      m.includes("unique constraint")
+    )
+  );
+}
+
+async function getExistingUrls(
+  supabase: SupabaseClient,
+  urls: string[],
+): Promise<Set<string>> {
+  const unique = Array.from(new Set(urls.filter(Boolean)));
+  if (unique.length === 0) return new Set();
+
+  const { data, error } = await supabase
+    .from("event_queue")
+    .select("url")
+    .in("url", unique);
+
+  if (error) {
+    // If this pre-check fails, fall back to relying on upsert behavior.
+    return new Set();
+  }
+
+  const existing = new Set<string>();
+  for (const row of (data as Array<{ url: string }> | null) ?? []) {
+    if (row?.url) existing.add(row.url);
+  }
+  return existing;
+}
+
+async function flushBatch(supabase: SupabaseClient) {
+  if (batchBuffer.length === 0) return;
+
+  const { error } = await supabase.from("event_queue").upsert(batchBuffer, {
+    onConflict: "url",
+    ignoreDuplicates: true,
+  });
+
+  if (error) {
+    throw new Error(`Supabase batch upsert failed: ${error.message}`);
+  }
+
+  batchBuffer = [];
+}
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -35,7 +88,7 @@ function requireEnv(name: string): string {
   return value;
 }
 
-function createSupabaseServerClient(): SupabaseClient {
+export function createSupabaseServerClient(): SupabaseClient {
   const url = requireEnv("NEXT_PUBLIC_SUPABASE_URL");
 
   // Prefer a server-only key for scripts; fall back to anon for local testing.
@@ -92,10 +145,6 @@ function toEpochMs(value: unknown): number {
   return Date.now();
 }
 
-function stableId(input: string): string {
-  return createHash("sha256").update(input).digest("hex");
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -132,13 +181,14 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
   const sources = await getActiveEventSources(supabase);
   const parser = new Parser({
     headers: {
-      "User-Agent": "Mozilla/5.0 (Trajectos Macro Intelligence Engine)",
+      "User-Agent": "Mozilla/5.0 TrajectosBot",
     },
     timeout: 10000,
-    xml2js: {
-      normalize: true,
-      normalizeTags: true,
-      explicitArray: false,
+    customFields: {
+      item: [
+        ["media:content", "mediaContent"],
+        ["media:thumbnail", "mediaThumbnail"],
+      ],
     },
   });
 
@@ -168,45 +218,49 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
 
       const rows: MacroEventRow[] = [];
       const seenUrls = new Set<string>();
-      const ingestedAt = new Date().toISOString();
 
-      const items = Array.isArray(feed.items)
-        ? feed.items
-        : Array.isArray((feed as any).entries)
-          ? (feed as any).entries
-          : [];
+      const rawItems =
+        feed.items ?? (feed as any).entries ?? (feed as any).entry ?? [];
+      const items = Array.isArray(rawItems) ? rawItems : [];
 
       if (!items.length) {
-        console.warn(`Feed returned no items: ${src.name}`);
+        console.warn("Feed returned no items", {
+          source: src.name,
+          url: src.rss_url,
+        });
         continue;
       }
 
+      console.log("Feed structure:", Object.keys(feed));
+      console.log("Items found:", items.length);
+      console.log("First item:", items[0]);
+
       for (const item of items) {
-        const title = (item.title ?? "").toString().trim();
-        const description = (
-          item.contentSnippet ?? item.summary ?? item.content ?? ""
-        )
-          .toString()
-          .trim();
+        const normalized = normalizeFeedItem(item, sourceLabel);
+        if (!normalized) continue;
 
-        const link = (item.link ?? item.id ?? "").toString().trim();
+        const url = normalized.url;
+        if (!url) continue;
+        if (seenUrls.has(url)) {
+          continue;
+        }
+        seenUrls.add(url);
 
-        if (link && seenUrls.has(link)) continue;
-        if (link) seenUrls.add(link);
+        const fullContent = await extractArticleContent(url);
+        await sleep(500);
 
-        if (!title) continue;
+        const title = normalized.title;
+        const description = fullContent ?? normalized.description;
+        const link = normalized.url;
 
-        const timestamp = toEpochMs(item.isoDate ?? item.pubDate);
-        const id = stableId(`${sourceLabel}::${title}::${link}::${timestamp}`);
+        const timestamp = toEpochMs(normalized.publishedAt);
 
         rows.push({
-          id,
           title,
           description,
           source: sourceLabel,
-          url: link,
+          url,
           published_at: new Date(timestamp).toISOString(),
-          ingested_at: ingestedAt,
           processed: false,
           category,
           geography: null,
@@ -218,17 +272,21 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
         continue;
       }
 
-      // Upsert requires a unique constraint on `id` in `macro_events_raw`.
-      const { data, error } = await supabase
-        .from("macro_events_raw")
-        .upsert(rows, { onConflict: "id" })
-        .select("id");
+      const existingUrls = await getExistingUrls(
+        supabase,
+        rows.map((r) => r.url),
+      );
+      const rowsToInsert = rows.filter((r) => !existingUrls.has(r.url));
 
-      if (error) {
-        throw new Error(`Supabase insert failed: ${error.message}`);
+      for (const row of rowsToInsert) {
+        batchBuffer.push(row);
+
+        if (batchBuffer.length >= BATCH_SIZE) {
+          await flushBatch(supabase);
+        }
       }
 
-      articlesInserted += data?.length ?? rows.length;
+      articlesInserted += rowsToInsert.length;
 
       try {
         await supabase
@@ -258,6 +316,8 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
       continue;
     }
   }
+
+  await flushBatch(supabase);
 
   return { sourcesProcessed, articlesInserted };
 }
