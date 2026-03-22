@@ -1,4 +1,5 @@
 import { createSupabaseServerClient } from "./newsFetcher";
+import { withStageSpan } from "./pipelineInstrumentation";
 
 type UntaggedInsightRow = {
   id: string;
@@ -45,27 +46,36 @@ export async function runInsightTagEngine(): Promise<void> {
 
     if (!insightId || !insight) continue;
 
-    const tags = extractTags(insight);
-    if (tags.length === 0) continue;
+    await withStageSpan({
+      supabase,
+      stageName: "insight_tagging",
+      clusterId: null,
+      eventId: null,
+      fn: async () => {
+        const tags = extractTags(insight);
+        if (tags.length === 0) return;
 
-    const inserts = tags.map((tag) => ({
-      insight_id: insightId,
-      tag,
-    }));
+        const inserts = tags.map((tag) => ({
+          insight_id: insightId,
+          tag,
+        }));
 
-    const { error: insertError } = await supabase.from("insight_tags").insert(inserts);
+        const { error: insertError } = await supabase.from("insight_tags").insert(inserts);
 
-    if (insertError) {
-      throw new Error(`Failed to insert insight tags: ${insertError.message}`);
-    }
+        if (insertError) {
+          throw new Error(`Failed to insert insight tags: ${insertError.message}`);
+        }
 
-    const { error: emitError } = await supabase.from("pipeline_events").insert({
-      event_type: "INSIGHT_TAGGED",
-      payload: { insight_id: insightId },
+        const { error: emitError } = await supabase.from("pipeline_events").insert({
+          event_type: "INSIGHT_TAGGED",
+          payload: { insight_id: insightId },
+        });
+
+        if (emitError) {
+          throw new Error(`Failed to emit INSIGHT_TAGGED event: ${emitError.message}`);
+        }
+      },
+      statusOnSuccess: "success",
     });
-
-    if (emitError) {
-      throw new Error(`Failed to emit INSIGHT_TAGGED event: ${emitError.message}`);
-    }
   }
 }

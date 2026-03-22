@@ -1,4 +1,10 @@
 import { createSupabaseServerClient } from "./newsFetcher";
+import { withStageSpan } from "./pipelineInstrumentation";
+import { workerPoolForEach } from "./workerPool";
+import { recordPipelineDeadLetter } from "./pipelineDeadLetterService";
+import { emitClusterEventOnce } from "./pipelineEventUtils";
+
+const BATCH_SIZE = 50;
 
 type PipelineEventRow = {
   id: string;
@@ -194,7 +200,7 @@ export async function runInsightEngine(): Promise<void> {
     .eq("event_type", "INSIGHT_REQUIRED")
     .eq("processed", false)
     .order("created_at", { ascending: true })
-    .limit(20);
+    .limit(BATCH_SIZE);
 
   if (error) {
     throw new Error(`Failed to load pipeline events: ${error.message}`);
@@ -203,83 +209,145 @@ export async function runInsightEngine(): Promise<void> {
   const pending = (events as PipelineEventRow[] | null) ?? [];
   if (pending.length === 0) return;
 
+  const seen = new Set<string>();
+  const unique: PipelineEventRow[] = [];
   for (const evt of pending) {
     const clusterId = extractClusterIdFromPayload(evt.payload);
-
     if (!clusterId) {
-      const { error: markError } = await supabase
-        .from("pipeline_events")
-        .update({ processed: true })
-        .eq("id", evt.id);
-
-      if (markError) {
-        throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
-      }
-
+      unique.push(evt);
       continue;
     }
+    if (seen.has(clusterId)) continue;
+    seen.add(clusterId);
+    unique.push(evt);
+  }
 
-    const { data: existingInsight, error: existingError } = await supabase
-      .from("event_insights")
-      .select("id")
-      .eq("cluster_id", clusterId)
-      .limit(1);
+  await workerPoolForEach(
+    unique,
+    async (evt) => {
+      const clusterId = extractClusterIdFromPayload(evt.payload);
+      try {
+        await withStageSpan({
+          supabase,
+          stageName: "insight",
+          clusterId,
+          eventId: evt.id,
+          statusOnSuccess: clusterId ? "success" : "skipped",
+          fn: async () => {
+        if (!clusterId) {
+          const { error: markError } = await supabase
+            .from("pipeline_events")
+            .update({ processed: true })
+            .eq("id", evt.id);
 
-    if (existingError) {
-      throw new Error(`Failed to check existing insights: ${existingError.message}`);
-    }
+          if (markError) {
+            throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
+          }
 
-    if ((existingInsight ?? []).length === 0) {
-      const signalsRows = await loadSignalsForCluster(clusterId);
-      if (signalsRows.length > 0) {
-        const exposuresRows = await loadExposuresForCluster(clusterId);
-        const exposures = toExposureMap(exposuresRows);
-
-        const signals: Record<
-          string,
-          { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }
-        > = {};
-
-        for (const row of signalsRows) {
-          const asset = (row.asset ?? "").toString().trim().toLowerCase();
-          if (!asset) continue;
-          const signal = normalizeSignal(row.signal);
-          const confidence = Number(row.confidence);
-          signals[asset] = {
-            signal,
-            confidence: Number.isFinite(confidence) ? confidence : 0.6,
-          };
+          return;
         }
 
-        const insight = buildInsightText(exposures, signals);
+        const { data: existingInsight, error: existingError } = await supabase
+          .from("event_insights")
+          .select("id")
+          .eq("cluster_id", clusterId)
+          .limit(1);
 
-        const conf = clamp(
-          0.5,
-          avg(Object.values(signals).map((s) => s.confidence)),
-          0.95,
-        );
+        if (existingError) {
+          throw new Error(`Failed to check existing insights: ${existingError.message}`);
+        }
 
-        const { error: insertError } = await supabase.from("event_insights").insert({
-          cluster_id: clusterId,
-          insight,
-          confidence: conf,
+        if ((existingInsight ?? []).length === 0) {
+          const signalsRows = await loadSignalsForCluster(clusterId);
+          if (signalsRows.length > 0) {
+            const exposuresRows = await loadExposuresForCluster(clusterId);
+            const exposures = toExposureMap(exposuresRows);
+
+            const signals: Record<
+              string,
+              { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }
+            > = {};
+
+            for (const row of signalsRows) {
+              const asset = (row.asset ?? "").toString().trim().toLowerCase();
+              if (!asset) continue;
+              const signal = normalizeSignal(row.signal);
+              const confidence = Number(row.confidence);
+              signals[asset] = {
+                signal,
+                confidence: Number.isFinite(confidence) ? confidence : 0.6,
+              };
+            }
+
+            const insight = buildInsightText(exposures, signals);
+
+            const conf = clamp(
+              0.5,
+              avg(Object.values(signals).map((s) => s.confidence)),
+              0.95,
+            );
+
+            const { error: insertError } = await supabase.from("event_insights").insert({
+              cluster_id: clusterId,
+              insight,
+              confidence: conf,
+            });
+
+            if (insertError) {
+              throw new Error(
+                `Failed to insert event insight: ${insertError.message} (cluster_id=${clusterId})`,
+              );
+            }
+          } else {
+            console.log(
+              "[insightEngine] no signals; skipping insight generation",
+              clusterId,
+            );
+          }
+        }
+
+        console.log("[insightEngine] emitting INSIGHT_COMPLETED", clusterId);
+
+        await emitClusterEventOnce({
+          supabase,
+          eventType: "INSIGHT_COMPLETED",
+          clusterId,
         });
 
-        if (insertError) {
-          throw new Error(
-            `Failed to insert event insight: ${insertError.message} (cluster_id=${clusterId})`,
-          );
+        const { error: markEventError } = await supabase
+          .from("pipeline_events")
+          .update({ processed: true })
+          .eq("id", evt.id);
+
+        if (markEventError) {
+          throw new Error(`Failed to mark pipeline event processed: ${markEventError.message}`);
+        }
+
+        console.log("[insightEngine] completed", clusterId);
+          },
+        });
+      } catch (err) {
+        await recordPipelineDeadLetter({
+          supabase,
+          id: evt.id,
+          clusterId,
+          stageName: "insight",
+          err,
+        });
+
+        const { error: markError } = await supabase
+          .from("pipeline_events")
+          .update({ processed: true })
+          .eq("id", evt.id);
+        if (markError) {
+          console.error("[insightEngine] failed to mark event processed after error", {
+            eventId: evt.id,
+            clusterId,
+            error: markError.message,
+          });
         }
       }
-    }
-
-    const { error: markEventError } = await supabase
-      .from("pipeline_events")
-      .update({ processed: true })
-      .eq("id", evt.id);
-
-    if (markEventError) {
-      throw new Error(`Failed to mark pipeline event processed: ${markEventError.message}`);
-    }
-  }
+    },
+    { concurrency: Number(process.env.PIPELINE_CONCURRENCY ?? 5) },
+  );
 }

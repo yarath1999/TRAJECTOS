@@ -2,9 +2,12 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import Parser from "rss-parser";
 import { normalizeFeedItem } from "@/lib/feedNormalizer";
 import { extractArticleContent } from "@/lib/articleExtractor";
+import { extractEntities } from "@/lib/extractEntities";
 
 const BATCH_SIZE = 50;
 let batchBuffer: any[] = [];
+
+let supabaseClient: SupabaseClient | null = null;
 
 type MacroEventRow = {
   title: string;
@@ -16,6 +19,7 @@ type MacroEventRow = {
   category: string;
   geography?: string | null;
   industries?: string[] | null;
+  entities?: string[] | null;
 };
 
 type EventSourceRow = {
@@ -89,6 +93,8 @@ function requireEnv(name: string): string {
 }
 
 export function createSupabaseServerClient(): SupabaseClient {
+  if (supabaseClient) return supabaseClient;
+
   const url = requireEnv("NEXT_PUBLIC_SUPABASE_URL");
 
   // Prefer a server-only key for scripts; fall back to anon for local testing.
@@ -102,16 +108,21 @@ export function createSupabaseServerClient(): SupabaseClient {
       "Missing Supabase key. Set SUPABASE_SERVICE_ROLE_KEY (recommended) or NEXT_PUBLIC_SUPABASE_ANON_KEY.",
     );
   }
-  console.log("Using key type:",
-  process.env.SUPABASE_SERVICE_ROLE_KEY ? "service_role" : "anon");
 
-  return createClient(url, key, {
+  console.log(
+    "Using key type:",
+    process.env.SUPABASE_SERVICE_ROLE_KEY ? "service_role" : "anon",
+  );
+
+  supabaseClient = createClient(url, key, {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
       detectSessionInUrl: false,
     },
   });
+
+  return supabaseClient;
 }
 
 async function getActiveEventSources(
@@ -265,6 +276,7 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
           category,
           geography: null,
           industries: null,
+          entities: extractEntities(`${title} ${description}`),
         });
       }
 

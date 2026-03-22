@@ -1,5 +1,9 @@
 import { createSupabaseServerClient } from "./newsFetcher";
 import { allocationModel, type AllocationSignal } from "@/lib/allocationModel";
+import { withStageSpan } from "./pipelineInstrumentation";
+import { workerPoolForEach } from "./workerPool";
+import { emitClusterEventOnce } from "./pipelineEventUtils";
+import { recordPipelineDeadLetter } from "./pipelineDeadLetterService";
 
 type PipelineEventRow = {
   id: string;
@@ -62,7 +66,7 @@ export async function runAllocationEngine(): Promise<void> {
   const { data: events, error } = await supabase
     .from("pipeline_events")
     .select("id,payload")
-    .eq("event_type", "INSIGHT_CREATED")
+    .eq("event_type", "ALLOCATION_REQUIRED")
     .eq("processed", false)
     .order("created_at", { ascending: true })
     .limit(20);
@@ -74,140 +78,196 @@ export async function runAllocationEngine(): Promise<void> {
   const pending = (events as PipelineEventRow[] | null) ?? [];
   if (pending.length === 0) return;
 
+  const seen = new Set<string>();
+  const unique: PipelineEventRow[] = [];
   for (const evt of pending) {
     const clusterId = extractClusterIdFromPayload(evt.payload);
-
     if (!clusterId) {
-      const { error: markError } = await supabase
-        .from("pipeline_events")
-        .update({ processed: true })
-        .eq("id", evt.id);
-
-      if (markError) {
-        throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
-      }
-
+      unique.push(evt);
       continue;
     }
-
-    const { data: existing, error: existingError } = await supabase
-      .from("portfolio_allocations")
-      .select("id")
-      .eq("cluster_id", clusterId)
-      .limit(1);
-
-    if (existingError) {
-      throw new Error(`Failed to check existing allocations: ${existingError.message}`);
-    }
-
-    if ((existing ?? []).length > 0) {
-      const { error: markError } = await supabase
-        .from("pipeline_events")
-        .update({ processed: true })
-        .eq("id", evt.id);
-
-      if (markError) {
-        throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
-      }
-
-      continue;
-    }
-
-    const { data: signalsRows, error: signalsError } = await supabase
-      .from("portfolio_signals")
-      .select("asset,signal,confidence")
-      .eq("cluster_id", clusterId);
-
-    if (signalsError) {
-      throw new Error(`Failed to load portfolio signals: ${signalsError.message}`);
-    }
-
-    const rows = (signalsRows as PortfolioSignal[] | null) ?? [];
-    if (rows.length === 0) {
-      const { error: markError } = await supabase
-        .from("pipeline_events")
-        .update({ processed: true })
-        .eq("id", evt.id);
-
-      if (markError) {
-        throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
-      }
-
-      continue;
-    }
-
-    const signalByAsset = new Map<string, { signal: AllocationSignal; confidence: number }>();
-    for (const row of rows) {
-      const asset = (row.asset ?? "").toString().trim().toLowerCase();
-      if (!asset) continue;
-      const signal = normalizeSignal(row.signal);
-      const conf = Number(row.confidence);
-      signalByAsset.set(asset, {
-        signal,
-        confidence: Number.isFinite(conf) ? conf : 0.6,
-      });
-    }
-
-    // Base weights example
-    const baseWeights: Record<string, number> = {
-      equities: 0.4,
-      bonds: 0.3,
-      commodities: 0.2,
-      usd: 0.1,
-      cash: 0,
-    };
-
-    const rawWeights: Record<string, number> = { ...baseWeights };
-
-    for (const asset of Object.keys(baseWeights)) {
-      if (asset === "cash") continue;
-      const entry = signalByAsset.get(asset);
-      if (!entry) continue;
-      rawWeights[asset] = (rawWeights[asset] ?? 0) + allocationModel[entry.signal];
-    }
-
-    const normalized = normalizeAllocations(rawWeights);
-
-    const clusterConfidence = Math.min(
-      0.95,
-      Math.max(0.5, avg(Array.from(signalByAsset.values()).map((v) => v.confidence))),
-    );
-
-    const inserts = Object.entries(normalized).map(([asset, allocation]) => {
-      const entry = signalByAsset.get(asset);
-      const confidence = entry?.confidence ?? clusterConfidence;
-      return {
-        cluster_id: clusterId,
-        asset,
-        allocation,
-        confidence,
-      };
-    });
-
-    const { error: insertError } = await supabase
-      .from("portfolio_allocations")
-      .insert(inserts);
-
-    if (insertError) {
-      throw new Error(`Failed to insert portfolio allocations: ${insertError.message}`);
-    }
-
-    const { error: markEventError } = await supabase
-      .from("pipeline_events")
-      .update({ processed: true })
-      .eq("id", evt.id);
-
-    if (markEventError) {
-      throw new Error(`Failed to mark pipeline event processed: ${markEventError.message}`);
-    }
-
-    const { error: emitError } = await supabase.from("pipeline_events").insert({
-      event_type: "ALLOCATION_CREATED",
-      payload: { cluster_id: clusterId },
-    });
-
-    if (emitError) {
-      throw new Error(`Failed to emit ALLOCATION_CREATED event: ${emitError.message}`);
-    }
+    if (seen.has(clusterId)) continue;
+    seen.add(clusterId);
+    unique.push(evt);
   }
+
+  await workerPoolForEach(
+    unique,
+    async (evt) => {
+      const clusterId = extractClusterIdFromPayload(evt.payload);
+      try {
+        await withStageSpan({
+          supabase,
+          stageName: "allocation",
+          clusterId,
+          eventId: evt.id,
+          statusOnSuccess: clusterId ? "success" : "skipped",
+          fn: async () => {
+        if (!clusterId) {
+          const { error: markError } = await supabase
+            .from("pipeline_events")
+            .update({ processed: true })
+            .eq("id", evt.id);
+
+          if (markError) {
+            throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
+          }
+
+          return;
+        }
+
+        const { data: existing, error: existingError } = await supabase
+          .from("portfolio_allocations")
+          .select("id")
+          .eq("cluster_id", clusterId)
+          .limit(1);
+
+        if (existingError) {
+          throw new Error(`Failed to check existing allocations: ${existingError.message}`);
+        }
+
+        if ((existing ?? []).length > 0) {
+          const { error: markError } = await supabase
+            .from("pipeline_events")
+            .update({ processed: true })
+            .eq("id", evt.id);
+
+          if (markError) {
+            throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
+          }
+
+          await emitClusterEventOnce({
+            supabase,
+            eventType: "ALLOCATION_COMPLETED",
+            clusterId,
+          });
+
+          return;
+        }
+
+        const { data: signalsRows, error: signalsError } = await supabase
+          .from("portfolio_signals")
+          .select("asset,signal,confidence")
+          .eq("cluster_id", clusterId);
+
+        if (signalsError) {
+          throw new Error(`Failed to load portfolio signals: ${signalsError.message}`);
+        }
+
+        const rows = (signalsRows as PortfolioSignal[] | null) ?? [];
+        if (rows.length === 0) {
+          const { error: markError } = await supabase
+            .from("pipeline_events")
+            .update({ processed: true })
+            .eq("id", evt.id);
+
+          if (markError) {
+            throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
+          }
+
+          await emitClusterEventOnce({
+            supabase,
+            eventType: "ALLOCATION_COMPLETED",
+            clusterId,
+          });
+
+          return;
+        }
+
+        const signalByAsset = new Map<string, { signal: AllocationSignal; confidence: number }>();
+        for (const row of rows) {
+          const asset = (row.asset ?? "").toString().trim().toLowerCase();
+          if (!asset) continue;
+          const signal = normalizeSignal(row.signal);
+          const conf = Number(row.confidence);
+          signalByAsset.set(asset, {
+            signal,
+            confidence: Number.isFinite(conf) ? conf : 0.6,
+          });
+        }
+
+        // Base weights example
+        const baseWeights: Record<string, number> = {
+          equities: 0.4,
+          bonds: 0.3,
+          commodities: 0.2,
+          usd: 0.1,
+          cash: 0,
+        };
+
+        const rawWeights: Record<string, number> = { ...baseWeights };
+
+        for (const asset of Object.keys(baseWeights)) {
+          if (asset === "cash") continue;
+          const entry = signalByAsset.get(asset);
+          if (!entry) continue;
+          rawWeights[asset] = (rawWeights[asset] ?? 0) + allocationModel[entry.signal];
+        }
+
+        const normalized = normalizeAllocations(rawWeights);
+
+        const clusterConfidence = Math.min(
+          0.95,
+          Math.max(0.5, avg(Array.from(signalByAsset.values()).map((v) => v.confidence))),
+        );
+
+        const inserts = Object.entries(normalized).map(([asset, allocation]) => {
+          const entry = signalByAsset.get(asset);
+          const confidence = entry?.confidence ?? clusterConfidence;
+          return {
+            cluster_id: clusterId,
+            asset,
+            allocation,
+            confidence,
+          };
+        });
+
+        const { error: insertError } = await supabase
+          .from("portfolio_allocations")
+          .insert(inserts);
+
+        if (insertError) {
+          throw new Error(`Failed to insert portfolio allocations: ${insertError.message}`);
+        }
+
+        const { error: markEventError } = await supabase
+          .from("pipeline_events")
+          .update({ processed: true })
+          .eq("id", evt.id);
+
+        if (markEventError) {
+          throw new Error(`Failed to mark pipeline event processed: ${markEventError.message}`);
+        }
+
+        await emitClusterEventOnce({
+          supabase,
+          eventType: "ALLOCATION_COMPLETED",
+          clusterId,
+        });
+          },
+        });
+      } catch (err) {
+        await recordPipelineDeadLetter({
+          supabase,
+          id: evt.id,
+          clusterId,
+          stageName: "allocation",
+          err,
+        });
+
+        const { error: markError } = await supabase
+          .from("pipeline_events")
+          .update({ processed: true })
+          .eq("id", evt.id);
+        if (markError) {
+          console.error("[allocationEngine] failed to mark event processed after error", {
+            eventId: evt.id,
+            clusterId,
+            error: markError.message,
+          });
+        }
+      }
+    },
+    { concurrency: Number(process.env.PIPELINE_CONCURRENCY ?? 5) || 5 },
+  );
 }

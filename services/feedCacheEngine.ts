@@ -9,6 +9,7 @@ type UserFeedRow = {
   user_id: string | null;
   insight_id: string | null;
   relevance_score: number | null;
+  ranking_score?: number | null;
   event_insights:
     | {
         insight: string | null;
@@ -82,6 +83,13 @@ function uniq<T>(items: T[]): T[] {
 export async function runFeedCacheEngine(): Promise<void> {
   const supabase = createSupabaseServerClient();
 
+  const { error: rankingProbeError } = await supabase
+    .from("user_feed")
+    .select("ranking_score")
+    .limit(1);
+
+  const supportsRankingScore = !rankingProbeError;
+
   const { data: events, error } = await supabase
     .from("pipeline_events")
     .select("id,payload")
@@ -113,14 +121,26 @@ export async function runFeedCacheEngine(): Promise<void> {
       continue;
     }
 
-    const { data: rows, error: feedError } = await supabase
-      .from("user_feed")
-      .select(
-        "user_id,insight_id,relevance_score,event_insights!inner(insight,created_at,cluster_id)",
-      )
-      .eq("user_id", userId)
-      .order("relevance_score", { ascending: false })
-      .limit(20);
+    const query = supportsRankingScore
+      ? supabase
+          .from("user_feed")
+          .select(
+            "user_id,insight_id,relevance_score,ranking_score,event_insights!inner(insight,created_at,cluster_id)",
+          )
+          .eq("user_id", userId)
+          .order("ranking_score", { ascending: false, nullsFirst: false })
+          .order("relevance_score", { ascending: false })
+          .limit(20)
+      : supabase
+          .from("user_feed")
+          .select(
+            "user_id,insight_id,relevance_score,event_insights!inner(insight,created_at,cluster_id)",
+          )
+          .eq("user_id", userId)
+          .order("relevance_score", { ascending: false })
+          .limit(20);
+
+    const { data: rows, error: feedError } = await query;
 
     if (feedError) {
       throw new Error(`Failed to load user feed for cache: ${feedError.message}`);
@@ -215,7 +235,9 @@ export async function runFeedCacheEngine(): Promise<void> {
     const feed: FeedCard[] = joined
       .map((r) => {
         const insightId = (r.insight_id ?? "").toString().trim();
-        const score = Number(r.relevance_score);
+        const rankingScore = Number(r.ranking_score);
+        const relevanceScore = Number(r.relevance_score);
+        const score = Number.isFinite(rankingScore) ? rankingScore : relevanceScore;
         const embedded = getEmbeddedInsight(r);
         const insightText = (embedded?.insight ?? "").toString().trim();
         const clusterId = (embedded?.cluster_id ?? "").toString().trim();

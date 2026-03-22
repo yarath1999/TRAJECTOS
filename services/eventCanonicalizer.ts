@@ -1,4 +1,5 @@
 import { createSupabaseServerClient } from "./newsFetcher";
+import { recordPipelineDeadLetter } from "./pipelineDeadLetterService";
 
 type ClusterRow = {
   id: string;
@@ -101,41 +102,59 @@ export async function runCanonicalizer(): Promise<void> {
     const clusterId = (cluster.id ?? "").toString().trim();
     if (!clusterId) continue;
 
+    try {
+
     // 2) Fetch articles in each cluster
-    const { data: articles, error: articlesError } = await supabase
+      const { data: articles, error: articlesError } = await supabase
       .from("macro_events_raw")
       .select("title,description,published_at")
       .eq("cluster_id", clusterId)
       .order("published_at", { ascending: true })
       .limit(200);
 
-    if (articlesError) {
-      throw new Error(
-        `Failed to load cluster articles: ${articlesError.message} (cluster_id=${clusterId})`,
-      );
-    }
+      if (articlesError) {
+        throw new Error(
+          `Failed to load cluster articles: ${articlesError.message} (cluster_id=${clusterId})`,
+        );
+      }
 
-    const articleRows = (articles as ArticleRow[] | null) ?? [];
-    if (articleRows.length === 0) continue;
+      const articleRows = (articles as ArticleRow[] | null) ?? [];
+      if (articleRows.length === 0) continue;
 
     // 3) Choose canonical title
-    const canonicalTitle = pickCanonicalTitle(articleRows);
+      const canonicalTitle = pickCanonicalTitle(articleRows);
 
     // 4) Generate canonical summary
-    const canonicalSummary = buildCanonicalSummary(articleRows);
+      const canonicalSummary = buildCanonicalSummary(articleRows);
 
-    // 5) Insert canonical event
-    const { error: insertError } = await supabase.from("canonical_events").insert({
-      cluster_id: clusterId,
-      canonical_title: canonicalTitle,
-      canonical_summary: canonicalSummary,
-      article_count: articleRows.length,
-    });
-
-    if (insertError) {
-      throw new Error(
-        `Failed to insert canonical event: ${insertError.message} (cluster_id=${clusterId})`,
+    // 5) Upsert canonical event (idempotent on cluster_id)
+    // - Updates canonical_title, canonical_summary, article_count
+    // - Preserves created_at by not including it in the payload
+      const { error: upsertError } = await supabase.from("canonical_events").upsert(
+        {
+          cluster_id: clusterId,
+          canonical_title: canonicalTitle,
+          canonical_summary: canonicalSummary,
+          article_count: articleRows.length,
+        },
+        {
+          onConflict: "cluster_id",
+        },
       );
+
+      if (upsertError) {
+        throw new Error(
+          `Failed to upsert canonical event: ${upsertError.message} (cluster_id=${clusterId})`,
+        );
+      }
+    } catch (err) {
+      await recordPipelineDeadLetter({
+        supabase,
+        clusterId,
+        stageName: "canonicalizer",
+        err,
+      });
+      continue;
     }
   }
 }

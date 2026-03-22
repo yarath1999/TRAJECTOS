@@ -191,8 +191,83 @@ async function cleanupPipelineEvents(): Promise<void> {
   console.log("Cleaned up old pipeline events");
 }
 
+async function ensurePipelineTables(): Promise<void> {
+  const supabase = createSupabaseServerClient();
+
+  const probe = await supabase.from("pipeline_events").select("id").limit(1);
+  if (!probe.error) return;
+
+  // Best-effort local initialization: Supabase cannot execute arbitrary SQL via
+  // the JS client unless the database exposes an RPC that runs SQL.
+  // If your local project defines one (commonly named exec_sql/execute_sql),
+  // we can use it here.
+  const sql = `
+    CREATE TABLE IF NOT EXISTS public.pipeline_events (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      event_type text NOT NULL,
+      payload jsonb,
+      processed boolean DEFAULT false,
+      created_at timestamptz DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pipeline_events_type
+      ON public.pipeline_events(event_type);
+
+    CREATE INDEX IF NOT EXISTS idx_pipeline_events_processed
+      ON public.pipeline_events(processed);
+  `;
+
+  const rpcCandidates = ["exec_sql", "execute_sql", "run_sql"] as const;
+  for (const fn of rpcCandidates) {
+    const { error } = await supabase.rpc(fn, { sql });
+    if (!error) {
+      console.log("Initialized missing pipeline tables.");
+      return;
+    }
+  }
+
+  console.warn(
+    "pipeline_events appears missing, but no SQL-exec RPC was available to auto-initialize. Apply migrations (recommended) or create an RPC like exec_sql(sql text).",
+    {
+      probeError: probe.error,
+    },
+  );
+}
+
+async function verifySchema(): Promise<void> {
+  const supabase = createSupabaseServerClient();
+
+  const requiredTables = [
+    "pipeline_events",
+    "event_clusters",
+    "macro_events_raw",
+    "event_insights",
+    "portfolio_signals",
+  ];
+
+  for (const table of requiredTables) {
+    const { error } = await supabase.from(table).select("id").limit(1);
+    if (error) {
+      throw new Error(`Missing required table: ${table}`);
+    }
+  }
+
+  // Verify required columns exist.
+  const { error: columnError } = await supabase
+    .from("event_clusters")
+    .select("id,validated,processed")
+    .limit(1);
+
+  if (columnError) {
+    throw new Error("Schema migration missing: event_clusters validation columns");
+  }
+}
+
 async function main(): Promise<void> {
   const results: StepResult[] = [];
+
+  await ensurePipelineTables();
+  await verifySchema();
 
   await cleanupPipelineEvents();
 

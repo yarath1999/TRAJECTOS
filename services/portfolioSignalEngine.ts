@@ -1,5 +1,9 @@
 import { createSupabaseServerClient } from "./newsFetcher";
 import { factorSignalMap } from "@/lib/factorSignalMap";
+import { withStageSpan } from "./pipelineInstrumentation";
+import { workerPoolForEach } from "./workerPool";
+import { emitClusterEventOnce } from "./pipelineEventUtils";
+import { recordPipelineDeadLetter } from "./pipelineDeadLetterService";
 
 type PipelineEventRow = {
   id: string;
@@ -99,7 +103,7 @@ export async function runPortfolioSignalEngine(): Promise<void> {
   const { data: events, error } = await supabase
     .from("pipeline_events")
     .select("id,payload")
-    .eq("event_type", "SIGNAL_CREATED")
+    .eq("event_type", "SIGNAL_REQUIRED")
     .eq("processed", false)
     .order("created_at", { ascending: true })
     .limit(20);
@@ -111,84 +115,131 @@ export async function runPortfolioSignalEngine(): Promise<void> {
   const pending = (events as PipelineEventRow[] | null) ?? [];
   if (pending.length === 0) return;
 
+  const seen = new Set<string>();
+  const unique: PipelineEventRow[] = [];
   for (const evt of pending) {
     const clusterId = extractClusterIdFromPayload(evt.payload);
-
     if (!clusterId) {
-      const { error: markError } = await supabase
-        .from("pipeline_events")
-        .update({ processed: true })
-        .eq("id", evt.id);
-
-      if (markError) {
-        throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
-      }
-
+      unique.push(evt);
       continue;
     }
+    if (seen.has(clusterId)) continue;
+    seen.add(clusterId);
+    unique.push(evt);
+  }
 
-    const { data: existingSignals, error: existingError } = await supabase
-      .from("portfolio_signals")
-      .select("id")
-      .eq("cluster_id", clusterId)
-      .limit(1);
+  await workerPoolForEach(
+    unique,
+    async (evt) => {
+      const clusterId = extractClusterIdFromPayload(evt.payload);
+      try {
+        await withStageSpan({
+          supabase,
+          stageName: "portfolio_signal",
+          clusterId,
+          eventId: evt.id,
+          statusOnSuccess: clusterId ? "success" : "skipped",
+          fn: async () => {
+        if (!clusterId) {
+          const { error: markError } = await supabase
+            .from("pipeline_events")
+            .update({ processed: true })
+            .eq("id", evt.id);
 
-    if (existingError) {
-      throw new Error(`Failed to check existing signals: ${existingError.message}`);
-    }
+          if (markError) {
+            throw new Error(`Failed to mark pipeline event processed: ${markError.message}`);
+          }
 
-    if ((existingSignals ?? []).length === 0) {
-      const exposures = await loadFactorExposuresForClusters([clusterId]);
+          return;
+        }
 
-      const factorSums = new Map<string, number>();
-      for (const row of exposures) {
-        const factor = (row.factor ?? "").toString().trim();
-        const exposure = Number(row.exposure);
-        if (!factor || !Number.isFinite(exposure)) continue;
-        factorSums.set(factor, (factorSums.get(factor) ?? 0) + exposure);
-      }
-
-      const signals = computeSignalsForCluster(factorSums).map((s) => ({
-        ...s,
-        cluster_id: clusterId,
-      }));
-
-      const { error: deleteError } = await supabase
-        .from("portfolio_signals")
-        .delete()
-        .eq("cluster_id", clusterId);
-
-      if (deleteError) {
-        throw new Error(`Failed to clear existing signals: ${deleteError.message}`);
-      }
-
-      if (signals.length > 0) {
-        const { error: insertError } = await supabase
+        const { data: existingSignals, error: existingError } = await supabase
           .from("portfolio_signals")
-          .insert(signals);
+          .select("id")
+          .eq("cluster_id", clusterId)
+          .limit(1);
 
-        if (insertError) {
-          throw new Error(`Failed to insert portfolio signals: ${insertError.message}`);
+        if (existingError) {
+          throw new Error(`Failed to check existing signals: ${existingError.message}`);
+        }
+
+        if ((existingSignals ?? []).length === 0) {
+          const exposures = await loadFactorExposuresForClusters([clusterId]);
+
+          const factorSums = new Map<string, number>();
+          for (const row of exposures) {
+            const factor = (row.factor ?? "").toString().trim();
+            const exposure = Number(row.exposure);
+            if (!factor || !Number.isFinite(exposure)) continue;
+            factorSums.set(factor, (factorSums.get(factor) ?? 0) + exposure);
+          }
+
+          const signals = computeSignalsForCluster(factorSums).map((s) => ({
+            ...s,
+            cluster_id: clusterId,
+          }));
+
+          const { error: deleteError } = await supabase
+            .from("portfolio_signals")
+            .delete()
+            .eq("cluster_id", clusterId);
+
+          if (deleteError) {
+            throw new Error(`Failed to clear existing signals: ${deleteError.message}`);
+          }
+
+          if (signals.length > 0) {
+            const { error: insertError } = await supabase
+              .from("portfolio_signals")
+              .insert(signals);
+
+            if (insertError) {
+              throw new Error(`Failed to insert portfolio signals: ${insertError.message}`);
+            }
+          }
+        }
+
+        const { error: markEventError } = await supabase
+          .from("pipeline_events")
+          .update({ processed: true })
+          .eq("id", evt.id);
+
+        if (markEventError) {
+          throw new Error(`Failed to mark pipeline event processed: ${markEventError.message}`);
+        }
+
+        await emitClusterEventOnce({
+          supabase,
+          eventType: "SIGNAL_COMPLETED",
+          clusterId,
+        });
+          },
+        });
+      } catch (err) {
+        await recordPipelineDeadLetter({
+          supabase,
+          id: evt.id,
+          clusterId,
+          stageName: "portfolio_signal",
+          err,
+        });
+
+        const { error: markError } = await supabase
+          .from("pipeline_events")
+          .update({ processed: true })
+          .eq("id", evt.id);
+        if (markError) {
+          console.error(
+            "[portfolioSignalEngine] failed to mark event processed after error",
+            {
+              eventId: evt.id,
+              clusterId,
+              error: markError.message,
+            },
+          );
         }
       }
-    }
-
-    const { error: markEventError } = await supabase
-      .from("pipeline_events")
-      .update({ processed: true })
-      .eq("id", evt.id);
-
-    if (markEventError) {
-      throw new Error(`Failed to mark pipeline event processed: ${markEventError.message}`);
-    }
-
-    const { error: emitError } = await supabase.from("pipeline_events").insert({
-      event_type: "INSIGHT_REQUIRED",
-      payload: { cluster_id: clusterId },
-    });
-
-    if (emitError) {
-      throw new Error(`Failed to emit INSIGHT_REQUIRED event: ${emitError.message}`);
-    }
-  }
+    },
+    { concurrency: Number(process.env.PIPELINE_CONCURRENCY ?? 5) || 5 },
+  );
 }

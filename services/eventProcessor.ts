@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createSupabaseServerClient } from "./newsFetcher";
 import { generateClusterKey } from "@/lib/clusterKey";
+import { extractEntities } from "@/lib/extractEntities";
 
 type QueuedEvent = {
   id: string;
@@ -11,12 +12,84 @@ type QueuedEvent = {
   category: string | null;
   geography: string | null;
   industries: string[] | null;
+  entities?: string[] | null;
   published_at: string | null;
   processed: boolean | null;
 };
 
 function stableId(input: string): string {
   return createHash("sha256").update(input).digest("hex");
+}
+
+function normalizeDescription(value: unknown): string {
+  return (typeof value === "string" ? value : "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function computeFingerprint(title: string, description: string): string {
+  const t = title.trim();
+  const d = normalizeDescription(description);
+  return createHash("sha256").update(`${t}${d}`).digest("hex");
+}
+
+async function shouldInsertByFingerprint(params: {
+  supabase: ReturnType<typeof createSupabaseServerClient>;
+  fingerprint: string;
+}): Promise<boolean> {
+  const nowIso = new Date().toISOString();
+
+  // First try to insert a new fingerprint (fast path).
+  const { data: inserted, error: insertError } = await params.supabase
+    .from("event_fingerprints")
+    .upsert(
+      {
+        fingerprint: params.fingerprint,
+        first_seen_at: nowIso,
+        last_seen_at: nowIso,
+      },
+      {
+        onConflict: "fingerprint",
+        ignoreDuplicates: true,
+      },
+    )
+    .select("fingerprint");
+
+  if (insertError) {
+    // Dedup must never block ingestion; if we can't check, insert normally.
+    return true;
+  }
+
+  if ((inserted ?? []).length > 0) {
+    return true;
+  }
+
+  // Fingerprint exists; only allow insert if it's older than 24 hours.
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: updated, error: updateError } = await params.supabase
+    .from("event_fingerprints")
+    .update({ last_seen_at: nowIso })
+    .eq("fingerprint", params.fingerprint)
+    .lt("last_seen_at", cutoff)
+    .select("fingerprint");
+
+  if (updateError) {
+    return true;
+  }
+
+  if ((updated ?? []).length > 0) {
+    return true;
+  }
+
+  // Within 24h: best-effort bump last_seen_at for observability.
+  await params.supabase
+    .from("event_fingerprints")
+    .update({ last_seen_at: nowIso })
+    .eq("fingerprint", params.fingerprint);
+
+  return false;
 }
 
 function toEpochMs(value: unknown): number {
@@ -41,7 +114,7 @@ export async function processEventQueue(): Promise<void> {
   const { data, error } = await supabase
     .from("event_queue")
     .select(
-      "id,title,description,source,url,category,geography,industries,published_at,processed",
+      "id,title,description,source,url,category,geography,industries,entities,published_at,processed",
     )
     .eq("processed", false)
     .limit(50);
@@ -61,7 +134,18 @@ export async function processEventQueue(): Promise<void> {
       continue;
     }
 
+    const fingerprint = computeFingerprint(event.title, event.description);
+    const shouldInsert = await shouldInsertByFingerprint({ supabase, fingerprint });
+    if (!shouldInsert) {
+      await supabase.from("event_queue").update({ processed: true }).eq("id", event.id);
+      continue;
+    }
+
     const clusterKey = generateClusterKey(event.title);
+
+    const entities = Array.isArray(event.entities)
+      ? event.entities
+      : extractEntities(`${event.title} ${event.description}`);
 
     const timestamp = toEpochMs(event.published_at);
     const id = stableId(
@@ -81,6 +165,7 @@ export async function processEventQueue(): Promise<void> {
         geography: event.geography,
         industries: event.industries,
         cluster_key: clusterKey,
+        entities,
       },
       { onConflict: "url" },
     );
