@@ -4,7 +4,7 @@ import { workerPoolForEach } from "./workerPool";
 import { emitClusterEventOnce } from "./pipelineEventUtils";
 import { recordPipelineDeadLetter } from "./pipelineDeadLetterService";
 
-const BATCH_SIZE = 50;
+const BATCH_SIZE = 100;
 
 type PipelineEventRow = {
   id: string;

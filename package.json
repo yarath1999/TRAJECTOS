@@ -6,13 +6,20 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "healthcheck": "tsx scripts/checkSystemHealth.ts",
+    "snapshots": "tsx --test tests/allocationSnapshots.test.ts",
+    "simulate": "tsx scripts/simulateAllocationScenarios.ts",
+    "allocation-worker": "tsx scripts/runAllocationEngine.ts",
+    "pipeline-monitor": "tsx services/pipelineMonitor.ts",
+    "pipeline-watchdog": "tsx services/pipelineWatchdog.ts"
   },
   "dependencies": {
     "@extractus/article-extractor": "^8.0.20",
     "@supabase/supabase-js": "^2.98.0",
-    "dotenv": "^17.3.1",
-    "next": "16.1.6",
+    "dotenv": "^17.4.2",
+    "next": "^16.2.6",
     "pg": "^8.20.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",

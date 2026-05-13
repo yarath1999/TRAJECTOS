@@ -162,7 +162,9 @@ foreach ($f in $files) {
 
   $content = ''
   try {
-    $content = Get-Content -LiteralPath $full -Raw -ErrorAction Stop
+    # Avoid PowerShell 5.1 default codepage issues (which can corrupt UTF-8 text).
+    # .NET will auto-detect BOMs and otherwise assumes UTF-8.
+    $content = [System.IO.File]::ReadAllText($full)
   } catch {
     $skippedBinary.Add([pscustomobject]@{ path = $rel; bytes = $f.Length; reason = 'unreadable_as_text' })
     continue

@@ -11,11 +11,11 @@ BEGIN
       ALTER INDEX public.idx_pipeline_event_unique_cluster
         RENAME TO idx_pipeline_events_unique_unprocessed;
     ELSE
-      EXECUTE $$
+      EXECUTE '
         CREATE UNIQUE INDEX idx_pipeline_events_unique_unprocessed
-        ON public.pipeline_events(event_type, (payload->>'cluster_id'))
+        ON public.pipeline_events(event_type, (payload->>''cluster_id''))
         WHERE processed = false
-      $$;
+      ';
     END IF;
   END IF;
 END

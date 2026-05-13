@@ -1,6 +1,12 @@
+import dotenv from 'dotenv';
+
+dotenv.config({ path: '.env.local' });
 import { createSupabaseServerClient } from "./newsFetcher";
 import { fileURLToPath } from "url";
 import path from "path";
+import { logEvent, logWarn } from "../utils/logger";
+import { getPerformanceSnapshot } from "../utils/performanceTracker";
+import { validateEnvOrThrow } from "../utils/validateEnv";
 
 type StageAggregate = {
   stage: string;
@@ -23,6 +29,36 @@ type FailureRow = {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+let shutdownRequested = false;
+let shutdownSignal: NodeJS.Signals | null = null;
+let shutdownResolver: (() => void) | null = null;
+
+function requestShutdown(signal: NodeJS.Signals): void {
+  if (shutdownRequested) return;
+  shutdownRequested = true;
+  shutdownSignal = signal;
+  logEvent("PIPELINE_MONITOR_SHUTDOWN_REQUESTED", { signal }, "WARN");
+
+  if (shutdownResolver) {
+    const resolve = shutdownResolver;
+    shutdownResolver = null;
+    resolve();
+  }
+}
+
+function sleepOrShutdown(ms: number): Promise<void> {
+  if (shutdownRequested) return Promise.resolve();
+  return Promise.race([
+    sleep(ms),
+    new Promise<void>((resolve) => {
+      shutdownResolver = resolve;
+    }),
+  ]);
+}
+
+process.once("SIGINT", () => requestShutdown("SIGINT"));
+process.once("SIGTERM", () => requestShutdown("SIGTERM"));
 
 function minuteBucketIso(date: Date): string {
   const ms = date.getTime();
@@ -223,9 +259,15 @@ async function tick(): Promise<void> {
   const failureRows = await fetchFailureRows(sinceIso);
 
   const stages = aggregateStages(runtimeRows, failureRows);
+  const performance = getPerformanceSnapshot();
 
   await writeMetricsSnapshot(windowStartIso, backlogSize, stages);
   printHealthSummary(windowStartIso, backlogSize, stages);
+  logEvent("PIPELINE_PERFORMANCE_METRICS", {
+    window_start: windowStartIso,
+    backlog_size: backlogSize,
+    ...performance,
+  }, "INFO");
 }
 
 /**
@@ -234,17 +276,32 @@ async function tick(): Promise<void> {
  * This is additive: it does not affect pipeline execution.
  */
 export async function runPipelineMonitor(): Promise<void> {
-  console.log("[pipelineMonitor] starting");
+  validateEnvOrThrow({
+    serviceName: "pipelineMonitor",
+    required: ["NEXT_PUBLIC_SUPABASE_URL"],
+    anyOf: [
+      {
+        names: ["SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SERVICE_KEY"],
+        label: "SUPABASE_SERVICE_ROLE_KEY | SUPABASE_SERVICE_KEY",
+      },
+    ],
+  });
 
-  while (true) {
+  logEvent("PIPELINE_MONITOR_START", {}, "INFO");
+
+  while (!shutdownRequested) {
     try {
       await tick();
     } catch (err) {
-      console.error("[pipelineMonitor] tick failed", err);
+      logWarn("PIPELINE_MONITOR_TICK_FAILED", {
+        error: err instanceof Error ? err.stack ?? err.message : String(err),
+      });
     }
 
-    await sleep(60_000);
+    await sleepOrShutdown(60_000);
   }
+
+  logEvent("PIPELINE_MONITOR_SHUTDOWN_COMPLETE", { signal: shutdownSignal }, "INFO");
 }
 
 function isMainModule(): boolean {

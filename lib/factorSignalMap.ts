@@ -3,6 +3,7 @@ export const factorSignalMap = {
     growth: 1,
     liquidity: 1,
     inflation: -0.5,
+    risk_sentiment: 1,
   },
 
   bonds: {

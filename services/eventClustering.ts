@@ -18,6 +18,18 @@ type MacroEventRow = {
 export async function runEventClustering(): Promise<void> {
   const supabase = createSupabaseServerClient();
 
+  const TOTAL_LIMIT = 50;
+  const recoveryMode = ["1", "true", "yes"].includes(
+    (process.env.CLUSTERING_RECOVERY_MODE ?? "").toString().trim().toLowerCase(),
+  );
+
+  const backlogLimit = (() => {
+    if (recoveryMode) return TOTAL_LIMIT;
+    const raw = Number(process.env.CLUSTERING_BACKLOG_LIMIT ?? "10");
+    if (!Number.isFinite(raw)) return 10;
+    return Math.max(0, Math.min(TOTAL_LIMIT, Math.floor(raw)));
+  })();
+
   const diagnostics = {
     rowsLoaded: 0,
     nullEmbedding: 0,
@@ -49,24 +61,96 @@ export async function runEventClustering(): Promise<void> {
 
   const lastProcessedIso = lastProcessed.toISOString();
 
-  const { data: events, error } = await supabase
-    .from("macro_events_raw")
-    .select("*")
-    .eq("clustered", false)
-    .gte("published_at", lastProcessedIso)
-    .order("published_at", { ascending: true })
-    .limit(50);
+  async function loadEventsBatch(): Promise<MacroEventRow[]> {
+    if (recoveryMode) {
+      const { data, error } = await supabase
+        .from("macro_events_raw")
+        .select("*")
+        .eq("clustered", false)
+        .order("published_at", { ascending: true, nullsFirst: true })
+        .order("id", { ascending: true })
+        .limit(TOTAL_LIMIT);
 
-  if (error) {
-    throw new Error(`Failed to load events: ${error.message}`);
+      if (error) {
+        throw new Error(`Failed to load events (recovery mode): ${error.message}`);
+      }
+
+      return (data as MacroEventRow[] | null) ?? [];
+    }
+
+    const newLimit = Math.max(0, TOTAL_LIMIT - backlogLimit);
+
+    const backlogQuery = backlogLimit
+      ? supabase
+          .from("macro_events_raw")
+          .select("*")
+          .eq("clustered", false)
+          // Backlog = unclustered rows older than the checkpoint OR missing published_at.
+          .or(`published_at.lt.${lastProcessedIso},published_at.is.null`)
+          .order("published_at", { ascending: true, nullsFirst: true })
+          .order("id", { ascending: true })
+          .limit(backlogLimit)
+      : null;
+
+    const newQuery = newLimit
+      ? supabase
+          .from("macro_events_raw")
+          .select("*")
+          .eq("clustered", false)
+          // New = unclustered rows at/after the checkpoint.
+          .gte("published_at", lastProcessedIso)
+          .order("published_at", { ascending: true, nullsFirst: false })
+          .order("id", { ascending: true })
+          .limit(newLimit)
+      : null;
+
+    const [{ data: backlogData, error: backlogError }, { data: newData, error: newError }] =
+      await Promise.all([
+        backlogQuery ?? Promise.resolve({ data: [], error: null } as any),
+        newQuery ?? Promise.resolve({ data: [], error: null } as any),
+      ]);
+
+    if (backlogError) {
+      throw new Error(`Failed to load backlog events: ${backlogError.message}`);
+    }
+    if (newError) {
+      throw new Error(`Failed to load new events: ${newError.message}`);
+    }
+
+    const combined = [...((backlogData as MacroEventRow[] | null) ?? []), ...((newData as MacroEventRow[] | null) ?? [])];
+    if (combined.length === 0) return [];
+
+    // De-dup + deterministic ordering.
+    const byId = new Map<string, MacroEventRow>();
+    for (const row of combined) {
+      if (!row?.id) continue;
+      if (!byId.has(row.id)) byId.set(row.id, row);
+    }
+
+    const out = Array.from(byId.values());
+    out.sort((a, b) => {
+      const aMs = a.published_at ? new Date(a.published_at).getTime() : Number.NEGATIVE_INFINITY;
+      const bMs = b.published_at ? new Date(b.published_at).getTime() : Number.NEGATIVE_INFINITY;
+      if (aMs !== bMs) return aMs - bMs;
+      return a.id.localeCompare(b.id);
+    });
+
+    return out.slice(0, TOTAL_LIMIT);
   }
 
+  const events = await loadEventsBatch();
+
   diagnostics.rowsLoaded = events?.length ?? 0;
-  console.log(`[eventClustering] Loaded ${diagnostics.rowsLoaded} macro_events_raw rows`);
+  console.log(
+    `[eventClustering] Loaded ${diagnostics.rowsLoaded} macro_events_raw rows (recoveryMode=${recoveryMode}, checkpoint=${lastProcessedIso}, backlogLimit=${backlogLimit})`,
+  );
 
   if (!events?.length) return;
 
-  let lastCheckpointMs: number | null = null;
+  // IMPORTANT: checkpoint must be monotonic; never move it backwards even if we
+  // process older backlog rows.
+  const lastProcessedMs = lastProcessed.getTime();
+  let lastCheckpointMs: number = Number.isFinite(lastProcessedMs) ? lastProcessedMs : 0;
   let lastCheckpointIso: string | null = null;
 
   for (const event of events as MacroEventRow[]) {
@@ -140,7 +224,7 @@ export async function runEventClustering(): Promise<void> {
       const publishedDate = new Date(event.published_at);
       const publishedMs = publishedDate.getTime();
       if (Number.isFinite(publishedMs)) {
-        if (lastCheckpointMs === null || publishedMs > lastCheckpointMs) {
+        if (publishedMs > lastCheckpointMs) {
           lastCheckpointMs = publishedMs;
           lastCheckpointIso = publishedDate.toISOString();
         }

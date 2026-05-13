@@ -3,8 +3,13 @@ import { withStageSpan } from "./pipelineInstrumentation";
 import { workerPoolForEach } from "./workerPool";
 import { recordPipelineDeadLetter } from "./pipelineDeadLetterService";
 import { emitClusterEventOnce } from "./pipelineEventUtils";
+import { hasSignificantInsightChange, type InsightState } from "./significantChange";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { factorSignalMap } from "@/lib/factorSignalMap";
+import { logDebug } from "../utils/logger";
+import { scoreRegimeSignals, type MacroRegime } from "./regimeEngine";
 
-const BATCH_SIZE = 50;
+const BATCH_SIZE = 100;
 
 type PipelineEventRow = {
   id: string;
@@ -41,13 +46,141 @@ type ExposureMap = {
   [key: string]: number;
 };
 
+type InsightReasoningSignal = {
+  direction: "BUY" | "SELL" | "NEUTRAL";
+  strength: number;
+  confidence: number;
+  source_factor: string;
+};
+
+type InsightReasoning = {
+  event_summary: string;
+  key_factors: string[];
+  market_implications: string[];
+  signals: InsightReasoningSignal[];
+  contradictions: string[];
+  regime: string | null;
+  net_bias:
+    | "bullish"
+    | "bearish"
+    | "neutral"
+    | "inflationary"
+    | "risk_off"
+    | "growth"
+    | "deflationary";
+  confidence: number;
+};
+
+type LatestInsightRow = {
+  id: string;
+  confidence: number | null;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseInsightStateFromReasoning(
+  reasoning: unknown,
+  confidenceFallback: number | null,
+): InsightState | null {
+  let value: unknown = reasoning;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!isRecord(value)) return null;
+
+  const netBiasRaw = (value.net_bias ?? "").toString().trim();
+  if (!netBiasRaw) return null;
+
+  const regimeRaw = value.regime;
+  const regime = regimeRaw == null ? null : regimeRaw.toString().trim() || null;
+
+  const confRaw = Number((value.confidence ?? confidenceFallback) as unknown);
+  const confidence = Number.isFinite(confRaw)
+    ? confRaw
+    : Number.isFinite(Number(confidenceFallback))
+      ? Number(confidenceFallback)
+      : NaN;
+
+  if (!Number.isFinite(confidence)) return null;
+
+  return { net_bias: netBiasRaw, regime, confidence };
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  const anyErr = err as { code?: unknown; message?: unknown } | null;
+  const code = (anyErr?.code ?? "").toString();
+  const message = (anyErr?.message ?? "").toString().toLowerCase();
+  return code === "23505" || message.includes("duplicate key value");
+}
+
 function clamp(min: number, value: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function avg(nums: number[]): number {
-  if (nums.length === 0) return 0;
-  return nums.reduce((a, b) => a + b, 0) / nums.length;
+function smoothConfidence(previous: number | null, current: number): number {
+  const curr = clamp(0, Number(current), 1);
+  if (!Number.isFinite(Number(previous))) return curr;
+  const prev = clamp(0, Number(previous), 1);
+  return clamp(0, prev * 0.7 + curr * 0.3, 1);
+}
+
+function computeAssetScoreFromExposures(exposures: ExposureMap, asset: string): number {
+  const weights = (factorSignalMap as Record<string, Record<string, number>>)[asset] ?? {};
+  let score = 0;
+  for (const [factor, weight] of Object.entries(weights)) {
+    const exposure = Number(exposures[factor] ?? 0);
+    if (!Number.isFinite(exposure) || !Number.isFinite(weight)) continue;
+    score += exposure * weight;
+  }
+  return score;
+}
+
+function computeInsightConfidence(
+  exposures: ExposureMap,
+  signalsByAsset: Record<string, { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }>,
+): number {
+  // Weighted confidence based on directional strength and reliability.
+  // - strength = min(1, abs(score))
+  // - reliability confidence comes from the signal engine (0..1)
+  // - NEUTRAL contributes nothing
+  let bullish_score = 0;
+  let bearish_score = 0;
+
+  for (const [asset, v] of Object.entries(signalsByAsset)) {
+    const direction = v.signal;
+    if (direction === "NEUTRAL") continue;
+
+    const reliability = clamp(0, Number(v.confidence), 1);
+    const score = computeAssetScoreFromExposures(exposures, asset);
+    let strength = Math.min(1, Math.abs(score));
+
+    // Ensure BUY/SELL strength is > 0 for downstream expectations.
+    if (strength <= 0) strength = 0.01;
+
+    const weighted = strength * reliability;
+    if (direction === "BUY") bullish_score += weighted;
+    else if (direction === "SELL") bearish_score += weighted;
+  }
+
+  const total_strength = bullish_score + bearish_score;
+  if (total_strength <= 0) return 0.5;
+
+  const agreement = Math.max(bullish_score, bearish_score) / total_strength;
+
+  const penalty =
+    bullish_score > 0 && bearish_score > 0
+      ? Math.min(bullish_score, bearish_score) / total_strength
+      : 0;
+
+  const confidence = agreement - 0.5 * penalty;
+  return clamp(0, confidence, 1);
 }
 
 function normalizeSignal(signal: string | null | undefined): "BUY" | "SELL" | "NEUTRAL" {
@@ -76,10 +209,10 @@ function toExposureMap(rows: FactorExposureRow[]): ExposureMap {
   return base;
 }
 
-function buildInsightText(
+function buildInsightImplications(
   exposures: ExposureMap,
   signals: Record<string, { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }>,
-): string {
+): string[] {
   const lines: string[] = [];
 
   const inflation = exposures.inflation ?? 0;
@@ -157,13 +290,169 @@ function buildInsightText(
     );
   }
 
-  // Join into a single paragraph.
-  return lines.join(" ");
+  return lines;
 }
 
-async function loadSignalsForCluster(clusterId: string): Promise<PortfolioSignalRow[]> {
-  const supabase = createSupabaseServerClient();
+function buildInsightText(
+  exposures: ExposureMap,
+  signals: Record<string, { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }>,
+): string {
+  // Join into a single paragraph.
+  return buildInsightImplications(exposures, signals).join(" ");
+}
 
+function buildKeyFactors(exposures: ExposureMap, limit: number): string[] {
+  const entries = Object.entries(exposures)
+    .map(([factor, exposure]) => ({ factor, exposure: Number(exposure) }))
+    .filter((e) => e.factor && Number.isFinite(e.exposure) && e.exposure !== 0);
+
+  entries.sort(
+    (a, b) => Math.abs(b.exposure) - Math.abs(a.exposure) || a.factor.localeCompare(b.factor),
+  );
+
+  return entries.slice(0, limit).map((e) => {
+    const sign = e.exposure > 0 ? "+" : "";
+    return `${e.factor} (${sign}${e.exposure.toFixed(2)})`;
+  });
+}
+
+function buildSignalsArray(
+  exposures: ExposureMap,
+  signals: Record<string, { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }>,
+): InsightReasoningSignal[] {
+  const assets = Object.keys(signals).sort((a, b) => a.localeCompare(b));
+  return assets.map((asset) => {
+    const v = signals[asset];
+    const conf = Number(v.confidence);
+    const confidence = Number.isFinite(conf) ? clamp(0, conf, 1) : 0.6;
+
+    // Strength reflects macro intensity (magnitude), not reliability.
+    // We re-score the asset using factor exposures and the same deterministic factor map.
+    const weights = (factorSignalMap as Record<string, Record<string, number>>)[asset] ?? {};
+    let score = 0;
+    for (const [factor, weight] of Object.entries(weights)) {
+      const exposure = Number(exposures[factor] ?? 0);
+      if (!Number.isFinite(exposure) || !Number.isFinite(weight)) continue;
+      score += exposure * weight;
+    }
+
+    let strength = v.signal === "NEUTRAL" ? 0 : Math.min(1, Math.abs(score));
+    if (v.signal !== "NEUTRAL" && strength <= 0) strength = 0.01;
+
+    return {
+      direction: v.signal,
+      strength,
+      confidence,
+      // Keep this as the asset key so downstream consumers can map it deterministically.
+      source_factor: asset,
+    };
+  });
+}
+
+function computeNetBias(signals: InsightReasoningSignal[]): "bullish" | "bearish" | "neutral" {
+  const buy = signals.filter((s) => s.direction === "BUY").length;
+  const sell = signals.filter((s) => s.direction === "SELL").length;
+  if (buy > sell) return "bullish";
+  if (sell > buy) return "bearish";
+  return "neutral";
+}
+
+function explanationForRegime(regime: MacroRegime | null): string | null {
+  switch (regime) {
+    case "inflationary":
+      return "Detected inflationary regime: bonds under pressure, commodities supported";
+    case "risk_off":
+      return "Detected risk_off regime: equities under pressure, USD supported";
+    case "growth":
+      return "Detected growth regime: equities and commodities supported";
+    case "deflationary":
+      return "Detected deflationary regime: bonds supported, equities under pressure";
+    default:
+      return null;
+  }
+}
+
+function buildContradictions(signals: InsightReasoningSignal[]): string[] {
+  const buys = signals.filter((s) => s.direction === "BUY").map((s) => s.source_factor);
+  const sells = signals.filter((s) => s.direction === "SELL").map((s) => s.source_factor);
+  if (buys.length === 0 || sells.length === 0) return [];
+  return [`Conflicting signals: BUY=[${buys.join(", ")}] SELL=[${sells.join(", ")}]`];
+}
+
+function buildEventSummary(
+  keyFactors: string[],
+  netBias: InsightReasoning["net_bias"],
+  signals: InsightReasoningSignal[],
+): string {
+  const signalSummary = signals
+    .filter((s) => s.direction !== "NEUTRAL")
+    .slice(0, 6)
+    .map((s) => `${s.source_factor} ${s.direction}`)
+    .join(", ");
+
+  const factorsText = keyFactors.length ? keyFactors.join(", ") : "mixed macro exposures";
+  const signalsText = signalSummary ? `Signals: ${signalSummary}. ` : "";
+
+  return `${signalsText}Key factors: ${factorsText}. Net bias: ${netBias}.`;
+}
+
+function buildReasoning(
+  exposures: ExposureMap,
+  signalsByAsset: Record<string, { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }>,
+  confidence: number,
+  clusterSummary: string | null,
+): InsightReasoning {
+  const signals = buildSignalsArray(exposures, signalsByAsset);
+  const regimeResult = scoreRegimeSignals(signals);
+  const regime = regimeResult.regime;
+  const explanation = explanationForRegime(regime);
+  logDebug("REGIME_SCORES", { scores: regimeResult.scores, topScore: regimeResult.topScore, secondScore: regimeResult.secondScore });
+  logDebug("REGIME_DETECTED", { regime });
+  const net_bias = regime ?? computeNetBias(signals);
+  const contradictions = buildContradictions(signals);
+  const key_factors = buildKeyFactors(exposures, 5);
+  const market_implications = buildInsightImplications(exposures, signalsByAsset);
+  const defaultSummary = buildEventSummary(key_factors, net_bias, signals);
+  const summaryFallback = (clusterSummary ?? "").toString().trim();
+  const withRegime = explanation ? `${explanation}. ${defaultSummary}` : defaultSummary;
+  const event_summary = signals.length === 0 && summaryFallback ? summaryFallback : withRegime;
+
+  return {
+    event_summary,
+    key_factors,
+    market_implications,
+    signals,
+    contradictions,
+    regime,
+    net_bias,
+    confidence,
+  };
+}
+
+async function loadClusterSummary(
+  supabase: SupabaseClient,
+  clusterId: string,
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("event_clusters")
+    .select("summary")
+    .eq("id", clusterId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to load cluster summary: ${error.message}`);
+  }
+
+  const summary = (data as { summary?: unknown } | null)?.summary;
+  if (summary == null) return null;
+  const trimmed = summary.toString().trim();
+  return trimmed ? trimmed : null;
+}
+
+async function loadSignalsForCluster(
+  supabase: SupabaseClient,
+  clusterId: string,
+): Promise<PortfolioSignalRow[]> {
   const { data, error } = await supabase
     .from("portfolio_signals")
     .select("cluster_id,asset,signal,confidence")
@@ -176,9 +465,10 @@ async function loadSignalsForCluster(clusterId: string): Promise<PortfolioSignal
   return (data as PortfolioSignalRow[] | null) ?? [];
 }
 
-async function loadExposuresForCluster(clusterId: string): Promise<FactorExposureRow[]> {
-  const supabase = createSupabaseServerClient();
-
+async function loadExposuresForCluster(
+  supabase: SupabaseClient,
+  clusterId: string,
+): Promise<FactorExposureRow[]> {
   const { data, error } = await supabase
     .from("event_factor_exposures")
     .select("factor,exposure")
@@ -247,72 +537,160 @@ export async function runInsightEngine(): Promise<void> {
           return;
         }
 
-        const { data: existingInsight, error: existingError } = await supabase
+        const { data: latestInsightRows, error: existingError } = await supabase
           .from("event_insights")
-          .select("id")
+          .select("id,confidence,reasoning")
           .eq("cluster_id", clusterId)
+          .order("created_at", { ascending: false })
           .limit(1);
 
         if (existingError) {
           throw new Error(`Failed to check existing insights: ${existingError.message}`);
         }
 
-        if ((existingInsight ?? []).length === 0) {
-          const signalsRows = await loadSignalsForCluster(clusterId);
-          if (signalsRows.length > 0) {
-            const exposuresRows = await loadExposuresForCluster(clusterId);
-            const exposures = toExposureMap(exposuresRows);
+        const existing = ((latestInsightRows as Array<LatestInsightRow & { reasoning?: unknown | null }> | null) ?? [])[0] ?? null;
 
-            const signals: Record<
-              string,
-              { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }
-            > = {};
+        const needsBackfill = !!existing && (existing as { reasoning?: unknown | null }).reasoning == null;
 
-            for (const row of signalsRows) {
-              const asset = (row.asset ?? "").toString().trim().toLowerCase();
-              if (!asset) continue;
-              const signal = normalizeSignal(row.signal);
-              const confidence = Number(row.confidence);
-              signals[asset] = {
-                signal,
-                confidence: Number.isFinite(confidence) ? confidence : 0.6,
-              };
-            }
+        const prevState = existing
+          ? parseInsightStateFromReasoning(
+              (existing as { reasoning?: unknown | null }).reasoning,
+              existing.confidence,
+            )
+          : null;
 
-            const insight = buildInsightText(exposures, signals);
+        const signalsRows = await loadSignalsForCluster(supabase, clusterId);
 
-            const conf = clamp(
-              0.5,
-              avg(Object.values(signals).map((s) => s.confidence)),
-              0.95,
-            );
+        const exposuresRows = await loadExposuresForCluster(supabase, clusterId);
+        const exposures = toExposureMap(exposuresRows);
 
+        const signals: Record<string, { signal: "BUY" | "SELL" | "NEUTRAL"; confidence: number }> = {};
+
+        for (const row of signalsRows) {
+          const asset = (row.asset ?? "").toString().trim().toLowerCase();
+          if (!asset) continue;
+          const signal = normalizeSignal(row.signal);
+          const confidence = Number(row.confidence);
+          signals[asset] = {
+            signal,
+            confidence: Number.isFinite(confidence) ? confidence : 0.6,
+          };
+        }
+
+        const insight = buildInsightText(exposures, signals);
+        const rawConf = computeInsightConfidence(exposures, signals);
+        const smoothedConf = smoothConfidence(existing?.confidence ?? null, rawConf);
+        const clusterSummary = await loadClusterSummary(supabase, clusterId);
+
+        // Always generate reasoning (never null/undefined), even if signals are empty.
+        const reasoning = buildReasoning(exposures, signals, smoothedConf, clusterSummary);
+
+        if (process.env.PIPELINE_DEBUG_INSIGHT_REASONING === "1") {
+          console.log("INSIGHT_REASONING:", reasoning);
+        }
+
+        const currentState: InsightState = {
+          net_bias: reasoning.net_bias,
+          regime: reasoning.regime,
+          confidence: smoothedConf,
+        };
+
+        const significantChange = needsBackfill || hasSignificantInsightChange(prevState, currentState);
+
+        const payload = {
+          insight,
+          reasoning,
+          confidence: smoothedConf,
+        };
+
+        if (significantChange) {
+          if (!existing) {
             const { error: insertError } = await supabase.from("event_insights").insert({
               cluster_id: clusterId,
-              insight,
-              confidence: conf,
+              ...payload,
             });
 
             if (insertError) {
+              if (isUniqueViolation(insertError)) {
+                const { error: updateError } = await supabase
+                  .from("event_insights")
+                  .update(payload)
+                  .eq("cluster_id", clusterId);
+
+                if (updateError) {
+                  throw new Error(
+                    `Failed to update event insight after duplicate insert: ${updateError.message} (cluster_id=${clusterId})`,
+                  );
+                }
+              } else {
+                throw new Error(
+                  `Failed to insert event insight: ${insertError.message} (cluster_id=${clusterId})`,
+                );
+              }
+            }
+          } else {
+            const { error: updateError } = await supabase
+              .from("event_insights")
+              .update(payload)
+              .eq("cluster_id", clusterId);
+
+            if (updateError) {
+              throw new Error(
+                `Failed to update event insight: ${updateError.message} (cluster_id=${clusterId})`,
+              );
+            }
+          }
+        } else if (existing) {
+          // Persist smoothed confidence/reasoning even when change is below significance threshold.
+          const { error: updateError } = await supabase
+            .from("event_insights")
+            .update(payload)
+            .eq("cluster_id", clusterId);
+
+          if (updateError) {
+            throw new Error(
+              `Failed to persist smoothed event insight: ${updateError.message} (cluster_id=${clusterId})`,
+            );
+          }
+        } else {
+          // No previous row: first run always stores the computed baseline without smoothing.
+          const { error: insertError } = await supabase.from("event_insights").insert({
+            cluster_id: clusterId,
+            ...payload,
+          });
+
+          if (insertError) {
+            if (isUniqueViolation(insertError)) {
+              const { error: updateError } = await supabase
+                .from("event_insights")
+                .update(payload)
+                .eq("cluster_id", clusterId);
+
+              if (updateError) {
+                throw new Error(
+                  `Failed to update event insight after duplicate insert: ${updateError.message} (cluster_id=${clusterId})`,
+                );
+              }
+            } else {
               throw new Error(
                 `Failed to insert event insight: ${insertError.message} (cluster_id=${clusterId})`,
               );
             }
-          } else {
-            console.log(
-              "[insightEngine] no signals; skipping insight generation",
-              clusterId,
-            );
           }
         }
 
-        console.log("[insightEngine] emitting INSIGHT_COMPLETED", clusterId);
-
-        await emitClusterEventOnce({
-          supabase,
-          eventType: "INSIGHT_COMPLETED",
-          clusterId,
-        });
+        try {
+          await emitClusterEventOnce({
+            supabase,
+            eventType: "INSIGHT_COMPLETED",
+            clusterId,
+            payload: { significant_change: significantChange },
+          });
+        } catch (err) {
+          throw new Error("INSIGHT_COMPLETED emission failed", {
+            cause: err as unknown,
+          });
+        }
 
         const { error: markEventError } = await supabase
           .from("pipeline_events")
@@ -323,7 +701,6 @@ export async function runInsightEngine(): Promise<void> {
           throw new Error(`Failed to mark pipeline event processed: ${markEventError.message}`);
         }
 
-        console.log("[insightEngine] completed", clusterId);
           },
         });
       } catch (err) {
@@ -335,16 +712,27 @@ export async function runInsightEngine(): Promise<void> {
           err,
         });
 
-        const { error: markError } = await supabase
-          .from("pipeline_events")
-          .update({ processed: true })
-          .eq("id", evt.id);
-        if (markError) {
-          console.error("[insightEngine] failed to mark event processed after error", {
-            eventId: evt.id,
-            clusterId,
-            error: markError.message,
-          });
+        // If INSIGHT_COMPLETED emission failed, leave the event unprocessed so it can be retried.
+        if ((err as { message?: unknown } | null)?.message !== "INSIGHT_COMPLETED emission failed") {
+          const { error: markError } = await supabase
+            .from("pipeline_events")
+            .update({ processed: true })
+            .eq("id", evt.id);
+          if (markError) {
+            console.error("[insightEngine] failed to mark event processed after error", {
+              eventId: evt.id,
+              clusterId,
+              error: markError.message,
+            });
+          }
+        } else {
+          console.error(
+            "[insightEngine] leaving event unprocessed due to INSIGHT_COMPLETED emit failure",
+            {
+              eventId: evt.id,
+              clusterId,
+            },
+          );
         }
       }
     },

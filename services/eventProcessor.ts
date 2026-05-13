@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { createWorkerRunId } from "../utils/performanceTracker";
+import { logEvent } from "../utils/logger";
 import { createSupabaseServerClient } from "./newsFetcher";
 import { generateClusterKey } from "@/lib/clusterKey";
 import { extractEntities } from "@/lib/extractEntities";
@@ -109,6 +111,9 @@ function toEpochMs(value: unknown): number {
 }
 
 export async function processEventQueue(): Promise<void> {
+  const runId = createWorkerRunId("event-queue");
+  logEvent("EVENT_QUEUE_RUN_START", { run_id: runId }, "INFO");
+
   const supabase = createSupabaseServerClient();
 
   const { data, error } = await supabase
@@ -123,7 +128,12 @@ export async function processEventQueue(): Promise<void> {
     throw new Error(`Failed to load event_queue: ${error.message}`);
   }
 
-  if (!data?.length) return;
+  if (!data?.length) {
+    logEvent("EVENT_QUEUE_RUN_COMPLETE", { run_id: runId, processed: 0 }, "INFO");
+    return;
+  }
+
+  let processed = 0;
 
   for (const event of data as QueuedEvent[]) {
     if (!event.url || !event.title || !event.description || !event.source) {
@@ -182,5 +192,9 @@ export async function processEventQueue(): Promise<void> {
     if (markError) {
       throw new Error(`Failed to mark queue processed: ${markError.message}`);
     }
+
+    processed += 1;
   }
+
+  logEvent("EVENT_QUEUE_RUN_COMPLETE", { run_id: runId, processed }, "INFO");
 }

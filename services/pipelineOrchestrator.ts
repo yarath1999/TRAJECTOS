@@ -1,6 +1,6 @@
 import "./loadEnv";
 import { createSupabaseServerClient } from "./newsFetcher";
-import { recordPipelineDeadLetter } from "./pipelineDeadLetterService";
+import { classifyDeadLetterFailure, recordPipelineDeadLetter } from "./pipelineDeadLetterService";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 type PipelineEventRow = {
@@ -50,6 +50,8 @@ async function deadLetterEvent(
   supabase: SupabaseClient,
   evt: PipelineEventRow,
   err: unknown,
+  failureReason?: "transient_failure" | "permanent_failure" | "malformed_payload_failure",
+  retryCount?: number,
 ): Promise<void> {
   const clusterId = extractClusterIdFromPayload(evt.payload);
 
@@ -60,6 +62,9 @@ async function deadLetterEvent(
     clusterId,
     stageName: "orchestrator",
     err,
+    failureReason,
+    retryCount,
+    lastAttemptAt: evt.created_at ?? new Date().toISOString(),
   });
 
   // Mark as processed so the pipeline won't get stuck on a poisoned event.
@@ -107,6 +112,20 @@ async function handleEventFailureWithRetries(
   evt: PipelineEventRow,
   err: unknown,
 ): Promise<void> {
+  const failureReason = classifyDeadLetterFailure(err);
+
+  if (failureReason !== "transient_failure") {
+    console.warn("[pipelineOrchestrator] event failed with non-retryable classification; dead-lettering", {
+      eventId: evt.id,
+      eventType: evt.event_type,
+      failureReason,
+      message: toErrorMessage(err),
+    });
+
+    await deadLetterEvent(supabase, evt, err, failureReason, Number((evt as { retry_count?: unknown }).retry_count ?? 0));
+    return;
+  }
+
   const retryCount = await incrementRetryCount(supabase, evt.id);
 
   // "More than 3 times" => dead-letter on the 4th failure.
@@ -118,9 +137,10 @@ async function handleEventFailureWithRetries(
         eventType: evt.event_type,
         retryCount,
         message: toErrorMessage(err),
+        failureReason,
       },
     );
-    await deadLetterEvent(supabase, evt, err);
+    await deadLetterEvent(supabase, evt, err, failureReason, retryCount);
     return;
   }
 
@@ -138,6 +158,19 @@ function extractClusterIdFromPayload(payload: unknown): string | null {
   if (typeof clusterId !== "string" && typeof clusterId !== "number") return null;
   const trimmed = clusterId.toString().trim();
   return trimmed ? trimmed : null;
+}
+
+function extractSignificantChangeFromPayload(payload: unknown): boolean | null {
+  if (!payload || typeof payload !== "object") return null;
+  const raw = (payload as { significant_change?: unknown }).significant_change;
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "number") return raw !== 0;
+  if (typeof raw === "string") {
+    const v = raw.trim().toLowerCase();
+    if (v === "true" || v === "1" || v === "yes") return true;
+    if (v === "false" || v === "0" || v === "no") return false;
+  }
+  return null;
 }
 
 async function markEventProcessed(supabase: SupabaseClient, id: string): Promise<void> {
@@ -159,6 +192,15 @@ function extractClusterIdFromJsonObject(payload: JsonObject): string | null {
   return trimmed ? trimmed : null;
 }
 
+function isUniqueViolation(message: string): boolean {
+  const m = (message ?? "").toLowerCase();
+  return (
+    m.includes("duplicate key value violates unique constraint") ||
+    m.includes("duplicate key value") ||
+    m.includes("unique constraint")
+  );
+}
+
 async function ensureEvent(
   supabase: SupabaseClient,
   eventType: string,
@@ -175,15 +217,17 @@ async function ensureEvent(
     .from("pipeline_events")
     .select("id")
     .eq("event_type", eventType)
-    .eq("processed", false)
     .eq("payload->>cluster_id", clusterId)
+    .eq("processed", false)
     .limit(1);
 
   if (existingError) {
     throw new Error(`Failed to check existing ${eventType} events: ${existingError.message}`);
   }
 
-  if ((existing ?? []).length > 0) return;
+  if ((existing ?? []).length > 0) {
+    return;
+  }
 
   const { error } = await supabase.from("pipeline_events").insert({
     event_type: eventType,
@@ -191,8 +235,15 @@ async function ensureEvent(
   });
 
   if (error) {
+    // Under concurrent orchestrators, the pre-check can race.
+    // The DB partial unique index is the source of truth.
+    if (isUniqueViolation(error.message)) {
+      return;
+    }
     throw new Error(`Failed to emit ${eventType} event: ${error.message}`);
   }
+
+  console.log("[orchestrator] emitted", eventType, clusterId);
 }
 
 async function handleEvent(supabase: SupabaseClient, evt: PipelineEventRow): Promise<void> {
@@ -277,6 +328,18 @@ async function handleEvent(supabase: SupabaseClient, evt: PipelineEventRow): Pro
         return;
       }
 
+      const significant = extractSignificantChangeFromPayload(evt.payload);
+      if (significant === false) {
+        if (process.env.PIPELINE_DEBUG_SIGNIFICANCE === "1") {
+          console.debug(
+            "[orchestrator] [event skipped] no significant change -> INSIGHT_REQUIRED",
+            clusterId,
+          );
+        }
+        await markEventProcessed(supabase, evt.id);
+        return;
+      }
+
       await ensureEvent(supabase, "INSIGHT_REQUIRED", { cluster_id: clusterId });
       await markEventProcessed(supabase, evt.id);
       return;
@@ -284,6 +347,18 @@ async function handleEvent(supabase: SupabaseClient, evt: PipelineEventRow): Pro
 
     case "INSIGHT_COMPLETED": {
       if (!clusterId) {
+        await markEventProcessed(supabase, evt.id);
+        return;
+      }
+
+      const significant = extractSignificantChangeFromPayload(evt.payload);
+      if (significant === false) {
+        if (process.env.PIPELINE_DEBUG_SIGNIFICANCE === "1") {
+          console.debug(
+            "[orchestrator] [event skipped] no significant change -> ALLOCATION_REQUIRED",
+            clusterId,
+          );
+        }
         await markEventProcessed(supabase, evt.id);
         return;
       }

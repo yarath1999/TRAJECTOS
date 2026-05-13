@@ -14,7 +14,8 @@ export async function workerPoolMap<T, R>(
   options?: WorkerPoolOptions,
 ): Promise<R[]> {
   const requested = options?.concurrency;
-  const normalized = Number.isFinite(requested) ? Math.floor(Number(requested)) : 5;
+  // Default higher for pipeline throughput; callers can still override via env.
+  const normalized = Number.isFinite(requested) ? Math.floor(Number(requested)) : 10;
   const concurrency = Math.max(1, normalized);
   if (items.length === 0) return [];
 
