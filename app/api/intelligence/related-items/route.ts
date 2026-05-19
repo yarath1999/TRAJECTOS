@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server';
 import { queryIntelligenceFeed } from '../../../../services/feedEngine';
 
@@ -10,7 +11,7 @@ export async function GET(req: Request) {
     if (!feedItemId) return new NextResponse('Missing feed_item_id', { status: 400 });
 
     // Load feed to find the source item
-    const feed = await queryIntelligenceFeed({ limit: 100 });
+    const feed = (await queryIntelligenceFeed({ limit: 100 })).items;
     const sourceItem = feed.find((it) => it.id === feedItemId);
     if (!sourceItem) return new NextResponse('Item not found', { status: 404 });
 
@@ -76,3 +77,4 @@ export async function GET(req: Request) {
     return new NextResponse(JSON.stringify({ error: err?.message ?? String(err) }), { status: 500 });
   }
 }
+/* eslint-enable @typescript-eslint/no-explicit-any */

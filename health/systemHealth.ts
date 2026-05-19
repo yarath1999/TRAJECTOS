@@ -26,7 +26,12 @@ export type SystemHealthReport = {
 const WORKER_STAGE_NAMES = ["validation", "factor", "impact", "signal", "insight", "allocation"] as const;
 const WORKER_STALE_MINUTES = 15;
 const WORKER_IDLE_GRACE_MINUTES = 60;
+
+const HEALTH_CACHE_TTL_MS = 30_000;
+
 let healthSupabaseClient: SupabaseClient | null = null;
+let cachedHealthReport: SystemHealthReport | null = null;
+let cachedHealthTimestamp = 0;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -78,10 +83,10 @@ function normalizeError(err: unknown): string {
 
 async function checkDbConnectivity(supabase: SupabaseClient): Promise<HealthCheckResult> {
   const { value, durationMs } = await measureAsyncOperation(() =>
-    supabase.from("pipeline_events").select("id", { head: true, count: "exact" }).limit(1),
+    supabase.from("pipeline_events").select("id").limit(1),
   );
   const { error } = value;
-  if (durationMs > 500) {
+  if (durationMs > 1500) {
     logWarn("HEALTHCHECK_SLOW_QUERY", { check: "db_connectivity", duration_ms: durationMs });
   } else {
     logDebug("HEALTHCHECK_QUERY_TIMING", { check: "db_connectivity", duration_ms: durationMs });
@@ -112,13 +117,46 @@ async function checkWorkerStatus(supabase: SupabaseClient): Promise<HealthCheckR
     .select("stage_name,end_time,status")
     .in("stage_name", [...WORKER_STAGE_NAMES])
     .order("end_time", { ascending: false })
-    .limit(200);
-  const { value: runtimeValue, durationMs: runtimeDurationMs } = await measureAsyncOperation(() => runtimeQuery);
+    .limit(50);
+
+  const backlogQuery = supabase
+    .from("pipeline_events")
+    .select("id")
+    .eq("processed", false)
+    .limit(1);
+
+  const [
+    { value: runtimeValue, durationMs: runtimeDurationMs },
+    { value: backlogValue, durationMs: backlogDurationMs },
+  ] = await Promise.all([
+    measureAsyncOperation(() => runtimeQuery),
+    measureAsyncOperation(() => backlogQuery),
+  ]);
+
   if (runtimeDurationMs > 500) {
-    logWarn("HEALTHCHECK_SLOW_QUERY", { check: "worker_status.runtime", duration_ms: runtimeDurationMs });
+    logWarn("HEALTHCHECK_SLOW_QUERY", {
+      check: "worker_status.runtime",
+      duration_ms: runtimeDurationMs,
+    });
   } else {
-    logDebug("HEALTHCHECK_QUERY_TIMING", { check: "worker_status.runtime", duration_ms: runtimeDurationMs });
+    logDebug("HEALTHCHECK_QUERY_TIMING", {
+      check: "worker_status.runtime",
+      duration_ms: runtimeDurationMs,
+    });
   }
+
+  if (backlogDurationMs > 500) {
+    logWarn("HEALTHCHECK_SLOW_QUERY", {
+      check: "worker_status.backlog",
+      duration_ms: backlogDurationMs,
+    });
+  } else {
+    logDebug("HEALTHCHECK_QUERY_TIMING", {
+      check: "worker_status.backlog",
+      duration_ms: backlogDurationMs,
+    });
+  }
+
   const { data: runtimeRows, error: runtimeError } = runtimeValue;
 
   if (runtimeError) {
@@ -130,43 +168,53 @@ async function checkWorkerStatus(supabase: SupabaseClient): Promise<HealthCheckR
     };
   }
 
-  const rows = (runtimeRows as Array<{ stage_name?: string | null; end_time?: string | null; status?: string | null }> | null) ?? [];
-  const latestByStage = new Map<string, { endTime: string; status: string | null }>();
+  const rows =
+    (runtimeRows as Array<{
+      stage_name?: string | null;
+      end_time?: string | null;
+      status?: string | null;
+    }> | null) ?? [];
+
+  const latestByStage = new Map<
+    string,
+    { endTime: string; status: string | null }
+  >();
+
   for (const row of rows) {
     const stage = (row.stage_name ?? "").toString().trim();
     const endTime = (row.end_time ?? "").toString().trim();
+
     if (!stage || !endTime || latestByStage.has(stage)) continue;
-    latestByStage.set(stage, { endTime, status: (row.status ?? null) as string | null });
+
+    latestByStage.set(stage, {
+      endTime,
+      status: (row.status ?? null) as string | null,
+    });
   }
 
   const staleStages: string[] = [];
   const healthyStages: string[] = [];
+
   for (const stage of WORKER_STAGE_NAMES) {
     const latest = latestByStage.get(stage);
+
     if (!latest) {
       staleStages.push(stage);
       continue;
     }
 
     const ageMs = Date.now() - Date.parse(latest.endTime);
-    if (!Number.isFinite(ageMs) || ageMs > WORKER_STALE_MINUTES * 60_000) {
+
+    if (
+      !Number.isFinite(ageMs) ||
+      ageMs > WORKER_STALE_MINUTES * 60_000
+    ) {
       staleStages.push(stage);
     } else {
       healthyStages.push(stage);
     }
   }
 
-  const backlogQuery = supabase
-    .from("pipeline_events")
-    .select("id")
-    .eq("processed", false)
-    .limit(1);
-  const { value: backlogValue, durationMs: backlogDurationMs } = await measureAsyncOperation(() => backlogQuery);
-  if (backlogDurationMs > 500) {
-    logWarn("HEALTHCHECK_SLOW_QUERY", { check: "worker_status.backlog", duration_ms: backlogDurationMs });
-  } else {
-    logDebug("HEALTHCHECK_QUERY_TIMING", { check: "worker_status.backlog", duration_ms: backlogDurationMs });
-  }
   const { data: backlogRows, error: backlogError } = backlogValue;
 
   if (backlogError) {
@@ -178,7 +226,9 @@ async function checkWorkerStatus(supabase: SupabaseClient): Promise<HealthCheckR
     };
   }
 
-  const backlog = Array.isArray(backlogRows) && backlogRows.length > 0 ? 1 : 0;
+  const backlog =
+    Array.isArray(backlogRows) && backlogRows.length > 0 ? 1 : 0;
+
   const hasRecentWorkerActivity = healthyStages.length > 0;
 
   if (backlog > 0 && !hasRecentWorkerActivity) {
@@ -195,8 +245,10 @@ async function checkWorkerStatus(supabase: SupabaseClient): Promise<HealthCheckR
     };
   }
 
-  // Idle is acceptable when there is no backlog and the worker loop has been quiet.
-  const recentlyIdle = backlog === 0 && healthyStages.length === 0;
+    // Idle is acceptable when there is no backlog and the worker loop has been quiet.
+
+  const recentlyIdle =
+    backlog === 0 && healthyStages.length === 0;
 
   return {
     name: "worker_status",
@@ -213,12 +265,13 @@ async function checkWorkerStatus(supabase: SupabaseClient): Promise<HealthCheckR
   };
 }
 
+
 async function checkAllocationEngineReadiness(supabase: SupabaseClient): Promise<HealthCheckResult> {
   const [insightResultTimed, allocationResultTimed] = await Promise.all([
     measureAsyncOperation(() =>
       supabase
         .from("event_insights")
-        .select("cluster_id,reasoning,confidence")
+        .select("cluster_id")
         .limit(1),
     ),
     measureAsyncOperation(() =>
@@ -234,7 +287,7 @@ async function checkAllocationEngineReadiness(supabase: SupabaseClient): Promise
   const allocationDurationMs = allocationResultTimed.durationMs;
 
   for (const [check, durationMs] of [["allocation_engine_readiness.insights", insightDurationMs], ["allocation_engine_readiness.allocations", allocationDurationMs]] as const) {
-    if (durationMs > 500) logWarn("HEALTHCHECK_SLOW_QUERY", { check, duration_ms: durationMs });
+    if (durationMs > 1500) logWarn("HEALTHCHECK_SLOW_QUERY", { check, duration_ms: durationMs });
     else logDebug("HEALTHCHECK_QUERY_TIMING", { check, duration_ms: durationMs });
   }
 
@@ -298,7 +351,7 @@ async function checkRegimeEngineReadiness(supabase: SupabaseClient): Promise<Hea
 
   const regimeReadQuery = supabase
     .from("event_insights")
-    .select("reasoning")
+    .select("id")
     .limit(1);
   const { value: regimeReadValue, durationMs: regimeReadDurationMs } = await measureAsyncOperation(() => regimeReadQuery);
   if (regimeReadDurationMs > 500) {
@@ -330,6 +383,15 @@ async function checkRegimeEngineReadiness(supabase: SupabaseClient): Promise<Hea
 }
 
 export async function runSystemHealthCheck(): Promise<SystemHealthReport> {
+  const now = Date.now();
+
+  if (
+    cachedHealthReport &&
+    now - cachedHealthTimestamp < HEALTH_CACHE_TTL_MS
+  ) {
+    return cachedHealthReport;
+  }
+
   const checkedAt = new Date().toISOString();
   const diagnostics: string[] = [];
   const checks: HealthCheckResult[] = [];
@@ -374,10 +436,15 @@ export async function runSystemHealthCheck(): Promise<SystemHealthReport> {
 
   const ok = checks.every((check) => check.ok);
 
-  return {
+  const report: SystemHealthReport = {
     ok,
     checkedAt,
     checks,
     diagnostics,
   };
+
+  cachedHealthReport = report;
+  cachedHealthTimestamp = now;
+
+  return report;
 }

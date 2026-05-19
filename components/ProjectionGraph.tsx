@@ -1,11 +1,12 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
+
 import {
   CartesianGrid,
   Legend,
   Line,
   LineChart,
-  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
@@ -36,12 +37,6 @@ function assertFiniteNumber(name: string, value: number): void {
   }
 }
 
-function formatMoney(value: number): string {
-  return new Intl.NumberFormat("en-IN", {
-    maximumFractionDigits: 0,
-  }).format(value);
-}
-
 function formatINRCurrency(value: number): string {
   return new Intl.NumberFormat("en-IN", {
     style: "currency",
@@ -56,6 +51,40 @@ export default function ProjectionGraph({
   r,
   n,
 }: ProjectionGraphProps) {
+  const chartHostRef = useRef<HTMLDivElement | null>(null);
+  const [chartSize, setChartSize] = useState<{ width: number; height: number }>({
+    width: 0,
+    height: 0,
+  });
+
+  useEffect(() => {
+    const element = chartHostRef.current;
+    if (!element) return;
+
+    const updateSize = () => {
+      const rect = element.getBoundingClientRect();
+      const nextWidth = Math.max(0, Math.floor(rect.width));
+      const nextHeight = Math.max(0, Math.floor(rect.height));
+      setChartSize((prev) => {
+        if (prev.width === nextWidth && prev.height === nextHeight) {
+          return prev;
+        }
+        return { width: nextWidth, height: nextHeight };
+      });
+    };
+
+    updateSize();
+
+    const observer = new ResizeObserver(() => {
+      updateSize();
+    });
+    observer.observe(element);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
   assertFiniteNumber("PV", PV);
   assertFiniteNumber("PMT", PMT);
   assertFiniteNumber("r", r);
@@ -87,10 +116,18 @@ export default function ProjectionGraph({
     }
   }
 
+  const canRenderChart = chartSize.width > 0 && chartSize.height > 0;
+
   return (
-    <div className="h-96 w-full rounded-lg border border-foreground/15 p-3">
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={data} margin={{ top: 8, right: 12, bottom: 8, left: 12 }}>
+    <div className="h-96 min-h-96 w-full min-w-0 rounded-lg border border-foreground/15 p-3">
+      <div ref={chartHostRef} className="h-full w-full min-h-0 min-w-0">
+        {canRenderChart ? (
+          <LineChart
+            width={chartSize.width}
+            height={chartSize.height}
+            data={data}
+            margin={{ top: 8, right: 12, bottom: 8, left: 12 }}
+          >
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis
             dataKey="year"
@@ -133,8 +170,9 @@ export default function ProjectionGraph({
               strokeWidth={2}
             />
           ) : null}
-        </LineChart>
-      </ResponsiveContainer>
+          </LineChart>
+        ) : null}
+      </div>
     </div>
   );
 }

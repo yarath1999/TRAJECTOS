@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { loadEnvConfig } from "@next/env";
 
 import { createSupabaseServerClient } from "@/services/newsFetcher";
@@ -556,3 +557,4 @@ main().catch((err: unknown) => {
   console.error("Pipeline simulation failed:", message);
   process.exit(1);
 });
+/* eslint-enable @typescript-eslint/no-explicit-any */

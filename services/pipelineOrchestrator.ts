@@ -1,6 +1,7 @@
 import "./loadEnv";
 import { createSupabaseServerClient } from "./newsFetcher";
 import { classifyDeadLetterFailure, recordPipelineDeadLetter } from "./pipelineDeadLetterService";
+import { logDebug } from "../utils/logger";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 type PipelineEventRow = {
@@ -330,12 +331,13 @@ async function handleEvent(supabase: SupabaseClient, evt: PipelineEventRow): Pro
 
       const significant = extractSignificantChangeFromPayload(evt.payload);
       if (significant === false) {
-        if (process.env.PIPELINE_DEBUG_SIGNIFICANCE === "1") {
-          console.debug(
-            "[orchestrator] [event skipped] no significant change -> INSIGHT_REQUIRED",
-            clusterId,
-          );
-        }
+          if (process.env.PIPELINE_DEBUG_SIGNIFICANCE === "1") {
+            logDebug("PIPELINE_EVENT_SKIPPED", {
+              cluster_id: clusterId,
+              next_event: "INSIGHT_REQUIRED",
+              reason: "no significant change",
+            });
+          }
         await markEventProcessed(supabase, evt.id);
         return;
       }
@@ -353,12 +355,13 @@ async function handleEvent(supabase: SupabaseClient, evt: PipelineEventRow): Pro
 
       const significant = extractSignificantChangeFromPayload(evt.payload);
       if (significant === false) {
-        if (process.env.PIPELINE_DEBUG_SIGNIFICANCE === "1") {
-          console.debug(
-            "[orchestrator] [event skipped] no significant change -> ALLOCATION_REQUIRED",
-            clusterId,
-          );
-        }
+          if (process.env.PIPELINE_DEBUG_SIGNIFICANCE === "1") {
+            logDebug("PIPELINE_EVENT_SKIPPED", {
+              cluster_id: clusterId,
+              next_event: "ALLOCATION_REQUIRED",
+              reason: "no significant change",
+            });
+          }
         await markEventProcessed(supabase, evt.id);
         return;
       }

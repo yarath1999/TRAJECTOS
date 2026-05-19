@@ -27,17 +27,21 @@ export default function SignupPage() {
 
     setIsSubmitting(true);
     try {
-      const { error: signUpError } = await supabase.auth.signUp({
-        email,
-        password,
-      });
+const { data, error: signUpError } = await supabase.auth.signUp({
+  email,
+  password,
+});
 
       if (signUpError) {
         setError(signUpError.message);
         return;
       }
 
-      router.replace("/");
+      if (data.session) {
+  router.replace("/");
+} else {
+  setError("Account created. Please verify your email before logging in.");
+}
     } finally {
       setIsSubmitting(false);
     }

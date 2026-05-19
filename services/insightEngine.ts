@@ -586,7 +586,12 @@ export async function runInsightEngine(): Promise<void> {
         const reasoning = buildReasoning(exposures, signals, smoothedConf, clusterSummary);
 
         if (process.env.PIPELINE_DEBUG_INSIGHT_REASONING === "1") {
-          console.log("INSIGHT_REASONING:", reasoning);
+          logDebug("INSIGHT_REASONING", {
+            cluster_id: clusterId,
+            regime: reasoning.regime,
+            confidence: smoothedConf,
+            signal_count: Object.keys(signals).length,
+          });
         }
 
         const currentState: InsightState = {

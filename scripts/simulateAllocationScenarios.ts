@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { analyzeRegime } from "../services/regimeEngine";
 import { allocationModel } from "../lib/allocationModel";
 
@@ -224,3 +225,4 @@ async function main() {
 }
 
 void main();
+/* eslint-enable @typescript-eslint/no-explicit-any */

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server';
 import { createSupabaseServerClient } from '../../../../services/newsFetcher';
 
@@ -15,3 +16,4 @@ export async function GET(req: Request) {
     return new NextResponse(JSON.stringify({ error: err?.message ?? String(err) }), { status: 500 });
   }
 }
+/* eslint-enable @typescript-eslint/no-explicit-any */

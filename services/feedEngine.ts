@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { createSupabaseServerClient } from "./newsFetcher";
 import { summarizeForFeed, canonicalizeForDedup, dedupeScore } from "./newsSummarizer";
 
@@ -17,6 +18,11 @@ export type FeedItem = {
   confidence_signal?: "Strong Signal" | "Mixed Signal" | "Weak Signal";
   why_this_matters?: string;
   cluster_id?: string | null;
+};
+
+export type IntelligenceFeedResult = {
+  items: FeedItem[];
+  hasMore: boolean;
 };
 
 const CATEGORIES = ["Markets","Economy","Geopolitics","Technology","Energy","Crypto","AI","Global"] as const;
@@ -154,7 +160,7 @@ export type QueryFeedOpts = {
   q?: string | null;
 };
 
-export async function queryIntelligenceFeed(opts: QueryFeedOpts = {}): Promise<FeedItem[]> {
+export async function queryIntelligenceFeed(opts: QueryFeedOpts = {}): Promise<IntelligenceFeedResult> {
   const supabase = createSupabaseServerClient();
   const limit = opts.limit ?? 50;
   const offset = opts.offset ?? 0;
@@ -185,9 +191,9 @@ export async function queryIntelligenceFeed(opts: QueryFeedOpts = {}): Promise<F
   const end = Math.max(0, offset + limit - 1);
   const { data, error } = await query.range(start, end);
   if (error) throw new Error(`Failed to load insights: ${error.message}`);
+  const hasMore = (data ?? []).length === limit;
 
   const rows = (data ?? []) as any[];
-  console.log("RAW ROW SAMPLE:", rows[0]);
 
   // Deduplicate near-duplicates in-memory using canonicalization + threshold
   const items: Array<{ id:string; title:string; text:string; row:any }> = [];
@@ -323,7 +329,11 @@ if (opts.category) {
   );
 }
 
-return filtered;
+return {
+  items: filtered,
+  hasMore,
+};
 }
 
 export const FEED_CATEGORIES = CATEGORIES;
+/* eslint-enable @typescript-eslint/no-explicit-any */

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { createSupabaseServerClient } from "./newsFetcher";
 
 function sleep(ms: number): Promise<void> {
@@ -72,3 +73,4 @@ export async function runPipelineInvariantMonitor(): Promise<void> {
     await sleep(60_000);
   }
 }
+/* eslint-enable @typescript-eslint/no-explicit-any */

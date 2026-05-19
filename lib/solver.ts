@@ -55,7 +55,7 @@ export function solveForN(PV: number, PMT: number, r: number, target: number): n
 
   const fvAtMax = futureValue(PV, PMT, r, maxYears);
   if (target > fvAtMax) {
-    throw new RangeError("Target cannot be reached within 0..50 years");
+    throw new RangeError("Target cannot be reached within the supported 50-year range");
   }
 
   let lo = minYears;

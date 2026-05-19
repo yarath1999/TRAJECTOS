@@ -7,7 +7,7 @@ export type NormalizedFeedItem = {
 };
 
 export function normalizeFeedItem(
-  item: any,
+  item: Record<string, unknown>,
   source: string,
 ): NormalizedFeedItem | null {
   const title = (item?.title ?? "").toString().trim();

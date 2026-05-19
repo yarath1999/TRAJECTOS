@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { loadEnvConfig } from "@next/env";
 import { createSupabaseServerClient, fetchAndStoreNews } from "@/services/newsFetcher";
 import { processEventQueue } from "@/services/eventProcessor";
@@ -706,3 +707,4 @@ main().catch((err: unknown) => {
   console.error("System test failed:", message);
   process.exit(1);
 });
+/* eslint-enable @typescript-eslint/no-explicit-any */

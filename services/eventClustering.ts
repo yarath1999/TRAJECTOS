@@ -106,8 +106,14 @@ export async function runEventClustering(): Promise<void> {
 
     const [{ data: backlogData, error: backlogError }, { data: newData, error: newError }] =
       await Promise.all([
-        backlogQuery ?? Promise.resolve({ data: [], error: null } as any),
-        newQuery ?? Promise.resolve({ data: [], error: null } as any),
+        backlogQuery ?? Promise.resolve({
+  data: [] as MacroEventRow[],
+  error: null as { message?: string } | null,
+}),
+        newQuery ?? Promise.resolve({
+  data: [] as MacroEventRow[],
+  error: null as { message?: string } | null,
+}),
       ]);
 
     if (backlogError) {

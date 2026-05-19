@@ -121,6 +121,13 @@ type DashboardData = {
 };
 
 const regimeParseCache = createMemoryCache<string, ReturnType<typeof regimeFromReasoning>>(200);
+type CachedHealthReport = {
+  data: Awaited<ReturnType<typeof runSystemHealthCheck>>;
+  createdAt: number;
+};
+
+const dashboardHealthCache =
+  createMemoryCache<string, CachedHealthReport>(1);
 let adminSupabaseClient: SupabaseClient | null = null;
 
 function fmtNumber(value: number | null | undefined, fractionDigits = 2): string {
@@ -270,30 +277,44 @@ function createAdminSupabaseClient(): SupabaseClient {
 
   return adminSupabaseClient;
 }
-
-async function queryCount(supabase: SupabaseClient, table: string, filter?: (query: any) => any): Promise<number> {
+/* eslint-disable @typescript-eslint/no-explicit-any */
+async function queryCount(
+  supabase: SupabaseClient,
+  table: string,
+  filter?: (query: any) => any
+): Promise<number> {
   let query = supabase.from(table).select("id", { head: true, count: "exact" });
   if (filter) query = filter(query);
   const { value, durationMs } = await measureAsyncOperation(() => query);
-  if (durationMs > 500) {
+  if (durationMs > 1500) {
     logWarn("DASHBOARD_SLOW_QUERY", { table, operation: "count", duration_ms: durationMs });
   } else {
-    logDebug("DASHBOARD_QUERY_TIMING", { table, operation: "count", duration_ms: durationMs });
+    if (process.env.NODE_ENV === "development") {
+      logDebug("DASHBOARD_QUERY_TIMING", { table, operation: "count", duration_ms: durationMs });
+    }
   }
-  const { count, error } = value;
+  const { count, error } = value as {
+  count: number | null;
+  error: { message: string } | null;
+};
   if (error) throw new Error(`${table}: ${error.message}`);
   return Number(count ?? 0);
 }
-
-async function safeQuery<T>(query: any): Promise<{ data: T[]; error: string | null }> {
+/* eslint-enable @typescript-eslint/no-explicit-any */
+async function safeQuery<T>(query: unknown): Promise<{ data: T[]; error: string | null }> {
   try {
     const { value, durationMs } = await measureAsyncOperation(() => query);
-    if (durationMs > 500) {
+    if (durationMs > 1500) {
       logWarn("DASHBOARD_SLOW_QUERY", { operation: "select", duration_ms: durationMs });
     } else {
-      logDebug("DASHBOARD_QUERY_TIMING", { operation: "select", duration_ms: durationMs });
+      if (process.env.NODE_ENV === "development") {
+        logDebug("DASHBOARD_QUERY_TIMING", { operation: "select", duration_ms: durationMs });
+      }
     }
-    const { data, error } = value;
+    const { data, error } = value as {
+  data: T[] | null;
+  error: { message?: string } | null;
+};
     if (error) return { data: [], error: error.message ?? "Query failed" };
     return { data: (data as T[] | null) ?? [], error: null };
   } catch (err) {
@@ -306,22 +327,106 @@ async function loadDashboardData(): Promise<DashboardData> {
   const since24hIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const recentWindowIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
-  const [healthReport, pendingCount, processedCount, failedCount, pipelineMetrics, insights, allocations, runtimeLogs, failureLogs, clusterRows] = await Promise.all([
-    runSystemHealthCheck(),
-    queryCount(supabase, "pipeline_events", (query) => query.eq("processed", false)),
-    queryCount(supabase, "pipeline_stage_runtime", (query) => query.gte("end_time", since24hIso).eq("status", "success")),
-    queryCount(supabase, "pipeline_failures", (query) => query.gte("occurred_at", since24hIso)),
-    safeQuery<PipelineMetricRow>(supabase.from("pipeline_metrics").select("processed_count,failure_count,backlog_size,window_start,stage_name").order("window_start", { ascending: false }).limit(1)),
-    safeQuery<InsightRow>(supabase.from("event_insights").select("cluster_id,reasoning,confidence,created_at").order("created_at", { ascending: false }).limit(20)),
-    safeQuery<AllocationRow>(supabase.from("event_allocations").select("cluster_id,asset,action,weight,confidence,created_at").order("created_at", { ascending: false }).limit(20)),
-    safeQuery<RuntimeRow>(supabase.from("pipeline_stage_runtime").select("stage_name,status,duration_ms,cluster_id,end_time").gte("end_time", recentWindowIso).order("end_time", { ascending: false }).limit(10)),
-    safeQuery<FailureRow>(supabase.from("pipeline_failures").select("stage_name,cluster_id,error_message,occurred_at").gte("occurred_at", recentWindowIso).order("occurred_at", { ascending: false }).limit(10)),
-    safeQuery<ClusterRow>(supabase.from("event_clusters").select("id,validated,created_at").order("created_at", { ascending: false }).limit(200)),
-  ]);
+  // Fetch the latest pipeline_metrics first (cheap aggregated row). If present,
+  // use its precomputed counters to avoid expensive full-table counts.
+  const pipelineMetricsPromise = safeQuery<PipelineMetricRow>(
+    supabase.from("pipeline_metrics").select("processed_count,failure_count,backlog_size,window_start,stage_name").order("window_start", { ascending: false }).limit(1),
+  );
+
+let cachedHealth = dashboardHealthCache.get("latest");
+
+let healthReport;
+
+if (
+  cachedHealth &&
+  Date.now() - cachedHealth.createdAt < 30000
+) {
+  healthReport = cachedHealth.data;
+} else {
+  healthReport = await runSystemHealthCheck();
+
+  dashboardHealthCache.set("latest", {
+    data: healthReport,
+    createdAt: Date.now(),
+  });
+}
+
+const [
+  pipelineMetrics,
+  insights,
+  allocations,
+  runtimeLogs,
+  failureLogs,
+  clusterRows,
+] = await Promise.all([
+  pipelineMetricsPromise,
+  safeQuery<InsightRow>(
+    supabase
+      .from("event_insights")
+      .select("cluster_id,reasoning,confidence,created_at")
+      .order("created_at", { ascending: false })
+      .limit(5)
+  ),
+  safeQuery<AllocationRow>(
+    supabase
+      .from("event_allocations")
+      .select("cluster_id,asset,action,weight,confidence,created_at")
+      .order("created_at", { ascending: false })
+      .limit(20)
+  ),
+  safeQuery<RuntimeRow>(
+    supabase
+      .from("pipeline_stage_runtime")
+      .select("stage_name,status,duration_ms,cluster_id,end_time")
+      .gte("end_time", recentWindowIso)
+      .order("end_time", { ascending: false })
+      .limit(10)
+  ),
+  safeQuery<FailureRow>(
+    supabase
+      .from("pipeline_failures")
+      .select("stage_name,cluster_id,error_message,occurred_at")
+      .gte("occurred_at", recentWindowIso)
+      .order("occurred_at", { ascending: false })
+      .limit(10)
+  ),
+  safeQuery<ClusterRow>(
+    supabase
+      .from("event_clusters")
+      .select("id,validated,created_at")
+      .order("created_at", { ascending: false })
+      .limit(15)
+  ),
+]);
 
   const latestMetric = pipelineMetrics.data[0] ?? null;
   const latestMetricAgeMs = latestMetric?.window_start ? Date.now() - new Date(latestMetric.window_start).getTime() : Number.POSITIVE_INFINITY;
   const monitorHealthy = Number.isFinite(latestMetricAgeMs) && latestMetricAgeMs < 5 * 60 * 1000;
+
+  // Compute counts: prefer aggregated snapshot, otherwise run targeted counts in parallel.
+  let pendingCount: number;
+  let processedCount: number;
+  let failedCount: number;
+
+  if (
+    latestMetric &&
+    Number.isFinite(Number(latestMetric.backlog_size)) &&
+    Number.isFinite(Number(latestMetric.processed_count)) &&
+    Number.isFinite(Number(latestMetric.failure_count))
+  ) {
+    pendingCount = Number(latestMetric.backlog_size ?? 0);
+    processedCount = Number(latestMetric.processed_count ?? 0);
+    failedCount = Number(latestMetric.failure_count ?? 0);
+  } else {
+    const [pPending, pProcessed, pFailed] = await Promise.all([
+      queryCount(supabase, "pipeline_events", (query) => query.eq("processed", false)),
+      queryCount(supabase, "pipeline_stage_runtime", (query) => query.gte("end_time", since24hIso).eq("status", "success")),
+      queryCount(supabase, "pipeline_failures", (query) => query.gte("occurred_at", since24hIso)),
+    ]);
+    pendingCount = pPending;
+    processedCount = pProcessed;
+    failedCount = pFailed;
+  }
 
   const stuckUnvalidated = clusterRows.data.filter((row) => row.validated === false && row.created_at && new Date(row.created_at).getTime() < Date.now() - 10 * 60 * 1000);
   const watchdogProblemCount = new Set(stuckUnvalidated.map((row) => row.id ?? "").filter(Boolean)).size;
@@ -331,28 +436,31 @@ async function loadDashboardData(): Promise<DashboardData> {
   const workerStatus = healthReport.checks.find((check) => check.name === "worker_status");
   const workerHealthy = workerStatus?.ok ?? false;
 
-  const regimeHistory = insights.data.slice(0, 5).map((row) => {
-    const derived = cachedRegimeFromReasoning(row.reasoning);
-    return {
-      regime: derived.regime,
-      confidence: derived.confidence,
-      createdAt: row.created_at ?? "",
-    };
-  });
+  // Avoid repeated parsing of `reasoning` by deriving once per insight row.
+  const insightsDerived = insights.data.map((row) => ({
+    row,
+    derived: cachedRegimeFromReasoning(row.reasoning),
+  }));
+
+  const regimeHistory = insightsDerived.slice(0, 5).map(({ row, derived }) => ({
+    regime: derived.regime,
+    confidence: derived.confidence,
+    createdAt: row.created_at ?? "",
+  }));
+
   const smoothingResult = computeSmoothing(regimeHistory);
   const currentRegime = regimeHistory[0]?.regime ?? null;
   const currentConfidence = regimeHistory[0]?.confidence ?? null;
 
-  const regimeDistribution = insights.data.reduce<Record<string, number>>((acc, row) => {
-    const derived = cachedRegimeFromReasoning(row.reasoning);
-    const key = derived.regime ?? "unclassified";
+  const regimeDistribution = insightsDerived.reduce<Record<string, number>>((acc, item) => {
+    const key = item.derived.regime ?? "unclassified";
     acc[key] = (acc[key] ?? 0) + 1;
     return acc;
   }, {});
 
-  const scoredInsights = insights.data.map((row) => cachedRegimeFromReasoning(row.reasoning)).filter((row) => row.regime);
+  const scoredInsights = insightsDerived.map((it) => it.derived).filter((d) => d.regime);
   const averageConfidence = scoredInsights.length > 0
-    ? scoredInsights.reduce((sum, row) => sum + Number(row.confidence ?? 0), 0) / scoredInsights.length
+    ? scoredInsights.reduce((sum, d) => sum + Number(d.confidence ?? 0), 0) / scoredInsights.length
     : null;
 
   const transitions: Array<{ from: MacroRegime; to: MacroRegime; createdAt: string }> = [];
@@ -491,10 +599,37 @@ function StructuredLogLine({ children }: { children: ReactNode }) {
 }
 
 async function AdminDashboard() {
-  try {
-    const data = await loadDashboardData();
+  let data: DashboardData | null = null;
+  let errorMessage: string | null = null;
 
+  try {
+    data = await loadDashboardData();
+  } catch (error) {
+    errorMessage =
+      error instanceof Error ? error.message : String(error);
+  }
+
+  if (!data) {
     return (
+      <div className="min-h-screen bg-slate-950 text-slate-100">
+        <main className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-6 py-8">
+          <Card
+            title="Operations Dashboard"
+            subtitle="Unable to load dashboard data"
+          >
+            <ErrorState message={errorMessage ?? "Unknown error"} />
+
+            <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-sm text-slate-300">
+              Verify the Supabase env vars, database connectivity,
+              and table migrations, then reload the page.
+            </div>
+          </Card>
+        </main>
+      </div>
+    );
+  }
+
+  return (
       <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(30,41,59,0.9),_rgba(2,6,23,1)_58%)] text-slate-100">
         <main className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-6 py-8">
           <header className="rounded-3xl border border-slate-800 bg-slate-950/60 p-6 backdrop-blur">
@@ -718,23 +853,7 @@ async function AdminDashboard() {
         </main>
       </div>
     );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100">
-        <main className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-6 py-8">
-          <Card title="Operations Dashboard" subtitle="Unable to load dashboard data">
-            <ErrorState message={message} />
-            <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-sm text-slate-300">
-              Verify the Supabase env vars, database connectivity, and table migrations, then reload the page.
-            </div>
-          </Card>
-        </main>
-      </div>
-    );
-  }
-}
-
+  } 
 export default function AdminPage() {
   return (
     <Suspense fallback={<LoadingState />}>

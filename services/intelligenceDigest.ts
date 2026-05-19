@@ -1,4 +1,3 @@
-import { createSupabaseServerClient } from "./newsFetcher";
 import { queryIntelligenceFeed } from "./feedEngine";
 
 export type DigestSummary = {
@@ -14,7 +13,7 @@ export type DigestSummary = {
 export async function generateDailyDigest(): Promise<DigestSummary> {
   // Load all insights from today (deterministic, no predictions)
   const today = new Date().toISOString().split('T')[0];
-  const items = await queryIntelligenceFeed({ limit: 200 });
+  const items = (await queryIntelligenceFeed({ limit: 200 })).items;
 
   const categoryCounts: Record<string, { count: number; critical_count: number }> = {};
   const assetMentions: Record<string, number> = {};
@@ -72,5 +71,11 @@ export async function generateDailyDigest(): Promise<DigestSummary> {
 export async function saveDailyDigest(digest: DigestSummary): Promise<void> {
   // In production, save to Supabase or blob storage
   // For now, this is a deterministic log-only function
-  console.log('Daily digest:', JSON.stringify(digest, null, 2));
+  console.info("Daily digest generated", {
+    period: digest.period,
+    generated_at: digest.generated_at,
+    total_items: digest.total_items,
+    category_count: Object.keys(digest.by_category).length,
+    key_story_count: digest.key_stories.length,
+  });
 }

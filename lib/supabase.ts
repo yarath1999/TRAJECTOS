@@ -52,16 +52,25 @@ function getSupabaseEnv(): SupabaseEnv | null {
  * - NEXT_PUBLIC_SUPABASE_URL
  * - NEXT_PUBLIC_SUPABASE_ANON_KEY
  */
+let browserClient: SupabaseClient | null = null;
+
 export function createSupabaseClient(): SupabaseClient | null {
   const env = getSupabaseEnv();
   if (!env) return null;
-  return createClient(env.url, env.anonKey, {
+
+  if (browserClient) {
+    return browserClient;
+  }
+
+  browserClient = createClient(env.url, env.anonKey, {
     auth: {
       persistSession: true,
       autoRefreshToken: true,
       detectSessionInUrl: true,
     },
   });
+
+  return browserClient;
 }
 
 /**

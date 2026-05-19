@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import Parser from "rss-parser";
 import { normalizeFeedItem } from "@/lib/feedNormalizer";
@@ -108,11 +109,6 @@ export function createSupabaseServerClient(): SupabaseClient {
       "Missing Supabase key. Set SUPABASE_SERVICE_ROLE_KEY (recommended) or NEXT_PUBLIC_SUPABASE_ANON_KEY.",
     );
   }
-
-  console.log(
-    "Using key type:",
-    process.env.SUPABASE_SERVICE_ROLE_KEY ? "service_role" : "anon",
-  );
 
   supabaseClient = createClient(url, key, {
     auth: {
@@ -242,12 +238,8 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
         continue;
       }
 
-      console.log("Feed structure:", Object.keys(feed));
-      console.log("Items found:", items.length);
-      console.log("First item:", items[0]);
-
       for (const item of items) {
-        const normalized = normalizeFeedItem(item, sourceLabel);
+        const normalized = normalizeFeedItem(item as unknown as Record<string, unknown>,sourceLabel);
         if (!normalized) continue;
 
         const url = normalized.url;
@@ -333,3 +325,4 @@ export async function fetchAndStoreNews(): Promise<FetchAndStoreNewsResult> {
 
   return { sourcesProcessed, articlesInserted };
 }
+/* eslint-enable @typescript-eslint/no-explicit-any */

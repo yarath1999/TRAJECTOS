@@ -8,7 +8,7 @@ export async function extractArticleContent(url: string): Promise<string | null>
 
     const maybeText = (result as unknown as { text?: string }).text;
     return result.content ?? maybeText ?? null;
-  } catch (error) {
+  } catch {
     console.warn("Article extraction failed:", url);
     return null;
   }

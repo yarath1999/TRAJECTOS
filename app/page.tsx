@@ -40,6 +40,10 @@ export default function Home() {
   const [isAuthChecked, setIsAuthChecked] = useState<boolean>(false);
   const didAutoRunFromProfile = useRef<boolean>(false);
 
+  const inputFormKey = inputs
+    ? `${inputs.currentSavings}:${inputs.monthlySavings}:${inputs.expectedReturn}:${inputs.targetAmount}:${inputs.timeHorizon}`
+    : "empty";
+
   useEffect(() => {
     let cancelled = false;
 
@@ -124,6 +128,11 @@ export default function Home() {
     }
   }, []);
 
+  const handleInvalidSubmit = useCallback(() => {
+    setResult(null);
+    setError(null);
+  }, []);
+
   useEffect(() => {
     if (!isAuthChecked) return;
     if (didAutoRunFromProfile.current) return;
@@ -202,7 +211,9 @@ export default function Home() {
           <h2 className="text-lg font-semibold">Financial Profile</h2>
           <div className="mt-3 rounded-lg border border-foreground/15 p-5">
             <InputForm
+              key={inputFormKey}
               onSubmit={handleSubmit}
+              onInvalidSubmit={handleInvalidSubmit}
               initialValues={inputs ?? undefined}
             />
           </div>

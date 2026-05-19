@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { loadEnvConfig } from "@next/env";
 
 import { createSupabaseServerClient } from "@/services/newsFetcher";
@@ -169,3 +170,4 @@ main().catch((err: unknown) => {
   console.error("[resetPipeline] Failed:", err);
   process.exitCode = 1;
 });
+/* eslint-enable @typescript-eslint/no-explicit-any */

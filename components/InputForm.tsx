@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 export type FinancialInputs = {
   currentSavings: number;
@@ -13,6 +13,8 @@ export type FinancialInputs = {
 export type InputFormProps = {
   /** Called with validated numeric values when the form is submitted. */
   onSubmit: (values: FinancialInputs) => void;
+  /** Called when submit validation fails so the parent can clear stale output. */
+  onInvalidSubmit?: () => void;
   /** Optional initial values to pre-populate the form (e.g. loaded from persistence). */
   initialValues?: Partial<FinancialInputs>;
 };
@@ -27,6 +29,16 @@ type FormState = {
 
 type FormErrors = Partial<Record<keyof FormState, string>>;
 
+function createFormState(initialValues?: Partial<FinancialInputs>): FormState {
+  return {
+    currentSavings: initialValues?.currentSavings === undefined ? "" : String(initialValues.currentSavings),
+    monthlySavings: initialValues?.monthlySavings === undefined ? "" : String(initialValues.monthlySavings),
+    expectedReturn: initialValues?.expectedReturn === undefined ? "" : String(initialValues.expectedReturn),
+    targetAmount: initialValues?.targetAmount === undefined ? "" : String(initialValues.targetAmount),
+    timeHorizon: initialValues?.timeHorizon === undefined ? "" : String(initialValues.timeHorizon),
+  };
+}
+
 function parseFiniteNumber(raw: string): number | null {
   // Treat empty/whitespace as invalid.
   const trimmed = raw.trim();
@@ -36,44 +48,11 @@ function parseFiniteNumber(raw: string): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
-export default function InputForm({ onSubmit, initialValues }: InputFormProps) {
-  const [form, setForm] = useState<FormState>({
-    currentSavings: "",
-    monthlySavings: "",
-    expectedReturn: "",
-    targetAmount: "",
-    timeHorizon: "",
-  });
+export default function InputForm({ onSubmit, onInvalidSubmit, initialValues }: InputFormProps) {
+  const [form, setForm] = useState<FormState>(() => createFormState(initialValues));
 
   const [errors, setErrors] = useState<FormErrors>({});
-
-  useEffect(() => {
-    if (!initialValues) return;
-
-    setForm((prev) => ({
-      ...prev,
-      currentSavings:
-        initialValues.currentSavings === undefined
-          ? prev.currentSavings
-          : String(initialValues.currentSavings),
-      monthlySavings:
-        initialValues.monthlySavings === undefined
-          ? prev.monthlySavings
-          : String(initialValues.monthlySavings),
-      expectedReturn:
-        initialValues.expectedReturn === undefined
-          ? prev.expectedReturn
-          : String(initialValues.expectedReturn),
-      targetAmount:
-        initialValues.targetAmount === undefined
-          ? prev.targetAmount
-          : String(initialValues.targetAmount),
-      timeHorizon:
-        initialValues.timeHorizon === undefined
-          ? prev.timeHorizon
-          : String(initialValues.timeHorizon),
-    }));
-  }, [initialValues]);
+  const invalidSubmit = onInvalidSubmit;
 
   function updateField(field: keyof FormState, value: string) {
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -130,6 +109,8 @@ export default function InputForm({ onSubmit, initialValues }: InputFormProps) {
 
     if (result.values) {
       onSubmit(result.values);
+    } else {
+      invalidSubmit?.();
     }
   }
 

@@ -1,10 +1,85 @@
 "use client";
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 
+import { createSupabaseClient } from '@/lib/supabase';
+
 const CATEGORIES = ["Markets","Economy","Geopolitics","Technology","Energy","Crypto","AI","Global"] as const;
 
-type FeedItem = any;
-type ColorScheme = 'light' | 'dark';
+type FeedItem = {
+  id: string;
+  title: string;
+  summary: string;
+  source?: string;
+  published_at?: string;
+
+  importance_score?: string;
+  market_impact?: string;
+  confidence_signal?: string;
+
+  regime_hint?: string;
+  category?: string;
+
+  affected_assets?: string[];
+
+  why_this_matters?: string;
+
+  cluster_id?: string;
+
+  bookmarked?: boolean;
+
+  [key: string]: unknown;
+};
+
+type SessionContext = {
+  accessToken: string;
+};
+
+async function fetchBookmarks(accessToken: string): Promise<string[]> {
+  const res = await fetch('/api/intelligence/bookmark', {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error('Failed to load bookmarks');
+  }
+
+  const body = await res.json();
+  return Array.isArray(body.bookmarks) ? body.bookmarks.map((value: unknown) => String(value)) : [];
+}
+
+function applyBookmarks(items: FeedItem[], bookmarkedIds: string[]): FeedItem[] {
+  const bookmarkedSet = new Set(bookmarkedIds);
+  return items.map((item) => ({
+    ...item,
+    bookmarked: bookmarkedSet.has(item.id),
+  }));
+}
+
+async function getSessionContext(retries = 40, delayMs = 250): Promise<SessionContext | null> {
+  try {
+    const supabase = createSupabaseClient();
+    if (!supabase) return null;
+
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      const { data, error } = await supabase.auth.getSession();
+      if (!error && data.session?.access_token) {
+        return {
+          accessToken: data.session.access_token,
+        };
+      }
+
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 async function fetchPage(offset: number, limit: number, q?: string, category?: string, importance?: string) {
   const params = new URLSearchParams();
@@ -16,7 +91,10 @@ async function fetchPage(offset: number, limit: number, q?: string, category?: s
   const res = await fetch(`/api/intelligence/feed?${params.toString()}`);
   if (!res.ok) throw new Error('Failed to load feed');
   const body = await res.json();
-  return body.items as FeedItem[];
+  return {
+    items: body.items as FeedItem[],
+    hasMore: Boolean(body.hasMore),
+  };
 }
 
 function SkeletonCard() {
@@ -34,7 +112,9 @@ function SkeletonCard() {
 export default function FeedClient() {
   const [items, setItems] = useState<FeedItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
   const [offset, setOffset] = useState(0);
+  const [bookmarkedIds, setBookmarkedIds] = useState<string[]>([]);
   const limit = 12;
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<string | null>(null);
@@ -43,10 +123,12 @@ export default function FeedClient() {
   const [pullRefresh, setPullRefresh] = useState(false);
   const [bookmarkAnimation, setBookmarkAnimation] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const [bookmarkError, setBookmarkError] = useState<string | null>(null);
   const loaderRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const touchStartY = useRef(0);
   const loadingRef = useRef(false);
+  const isBootstrappingRef = useRef(true);
 
   const colors = {
     light: { bg: '#ffffff', text: '#000', border: '#eee', card: '#f9f9f9', textMuted: '#666' },
@@ -63,7 +145,7 @@ export default function FeedClient() {
   }, []);
 
 const loadMore = useCallback(async () => {
-  if (loadingRef.current) return;
+  if (loadingRef.current || !hasMore || isBootstrappingRef.current) return;
 
   loadingRef.current = true;
   setLoading(true);
@@ -80,30 +162,80 @@ const loadMore = useCallback(async () => {
     setItems((s) => {
   const existing = new Set(s.map((x) => x.id));
 
-  const unique = page.filter((x) => !existing.has(x.id));
+  const unique = applyBookmarks(page.items.filter((x) => !existing.has(x.id)), bookmarkedIds);
 
   return [...s, ...unique];
 });
-    setOffset((o) => o + page.length);
+    setOffset((o) => o + page.items.length);
+    setHasMore(page.hasMore);
   } finally {
     setLoading(false);
     loadingRef.current = false;
   }
-}, [offset, query, category, importance]);
+}, [offset, query, category, importance, hasMore, bookmarkedIds]);
 
   // Reset when filters change
   useEffect(() => {
     let mounted = true;
     (async () => {
+      isBootstrappingRef.current = true;
+      loadingRef.current = true;
       setLoading(true);
       try {
-        const first = await fetchPage(0, limit, query || undefined, category || undefined, importance || undefined);
+        const sessionContext = await getSessionContext();
+        const [first, bookmarkList] = await Promise.all([
+          fetchPage(0, limit, query || undefined, category || undefined, importance || undefined),
+          sessionContext ? fetchBookmarks(sessionContext.accessToken) : Promise.resolve([]),
+        ]);
         if (!mounted) return;
-        setItems(first);
-        setOffset(first.length);
-      } finally { if (mounted) setLoading(false); }
+        setBookmarkedIds(bookmarkList);
+        setItems(applyBookmarks(first.items, bookmarkList));
+        setOffset(first.items.length);
+        setHasMore(first.hasMore);
+      } finally {
+        if (mounted) {
+          setLoading(false);
+          loadingRef.current = false;
+          isBootstrappingRef.current = false;
+        }
+      }
     })();
     return () => { mounted = false; };
+  }, [query, category, importance]);
+
+  // Rehydrate bookmarks again when Supabase finishes restoring auth state.
+  useEffect(() => {
+    let mounted = true;
+    const supabase = createSupabaseClient();
+    if (!supabase) return;
+
+    const syncBookmarks = async (accessToken: string) => {
+      try {
+        const bookmarkList = await fetchBookmarks(accessToken);
+        if (!mounted) return;
+        setBookmarkedIds(bookmarkList);
+        setItems((current) => applyBookmarks(current, bookmarkList));
+      } catch (error) {
+        console.error(error);
+      }
+    };
+
+    void (async () => {
+      const sessionContext = await getSessionContext();
+      if (mounted && sessionContext) {
+        await syncBookmarks(sessionContext.accessToken);
+      }
+    })();
+
+    const { data: authSubscription } = supabase.auth.onAuthStateChange((_, session) => {
+      if (!mounted || !session?.access_token) return;
+      void syncBookmarks(session.access_token);
+    });
+
+    return () => {
+      mounted = false;
+      authSubscription.subscription.unsubscribe();
+    };
   }, [query, category, importance]);
 
   // Infinite scroll
@@ -112,8 +244,10 @@ const loadMore = useCallback(async () => {
     if (!el) return;
     const obs = new IntersectionObserver((entries) => {
       if (
-        entries[0].isIntersecting &&
+        entries[0]?.isIntersecting &&
         !loading &&
+        hasMore &&
+        !isBootstrappingRef.current &&
         !loadingRef.current
     ) {
         loadMore().catch(console.error);
@@ -121,16 +255,16 @@ const loadMore = useCallback(async () => {
     });
     obs.observe(el);
     return () => obs.disconnect();
-  }, [loaderRef.current, loading, loadMore]);
+  }, [loading, loadMore, hasMore]);
 
   // Pull-to-refresh
   const handleTouchStart = (e: React.TouchEvent) => {
-    touchStartY.current = e.touches[0].clientY;
+    touchStartY.current = e.touches[0]?.clientY ?? 0;
   };
 
   const handleTouchMove = (e: React.TouchEvent) => {
     if (!containerRef.current) return;
-    const dy = e.touches[0].clientY - touchStartY.current;
+    const dy = (e.touches[0]?.clientY ?? 0) - touchStartY.current;
     if (containerRef.current.scrollTop === 0 && dy > 60) {
       setPullRefresh(true);
     }
@@ -139,31 +273,55 @@ const loadMore = useCallback(async () => {
   const handleTouchEnd = async () => {
     if (pullRefresh) {
       setPullRefresh(false);
+      loadingRef.current = true;
+      setLoading(true);
       try {
-        const first = await fetchPage(0, limit, query || undefined, category || undefined, importance || undefined);
-        setItems(first);
-        setOffset(first.length);
+        const sessionContext = await getSessionContext();
+        const [first, bookmarkList] = await Promise.all([
+          fetchPage(0, limit, query || undefined, category || undefined, importance || undefined),
+          sessionContext ? fetchBookmarks(sessionContext.accessToken) : Promise.resolve([]),
+        ]);
+        setBookmarkedIds(bookmarkList);
+        setItems(applyBookmarks(first.items, bookmarkList));
+        setOffset(first.items.length);
+        setHasMore(first.hasMore);
       } catch (err) {
         console.error(err);
+      } finally {
+        setLoading(false);
+        loadingRef.current = false;
       }
     }
   };
 
   async function toggleBookmark(itemId: string) {
     try {
-      const token = await getAuthToken();
-      const res = await fetch('/api/intelligence/bookmark', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ feedItemId: itemId }) });
+      setBookmarkError(null);
+      const sessionContext = await getSessionContext();
+      if (!sessionContext) {
+        setBookmarkError('Sign in to save bookmarks.');
+        return;
+      }
+
+      const res = await fetch('/api/intelligence/bookmark', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionContext.accessToken}` }, body: JSON.stringify({ eventId: itemId, feedItemId: itemId }) });
       if (!res.ok) throw new Error('bookmark failed');
+
       const json = await res.json();
       setBookmarkAnimation(itemId);
       setTimeout(() => setBookmarkAnimation(null), 600);
-      if (json.removed) {
-        setItems((s) => s.map((it) => (it.id === itemId ? { ...it, bookmarked: false } : it)));
-      } else {
-        setItems((s) => s.map((it) => (it.id === itemId ? { ...it, bookmarked: true } : it)));
-      }
+      setBookmarkedIds((current) => {
+        const next = new Set(current);
+        if (json.removed) {
+          next.delete(itemId);
+        } else {
+          next.add(itemId);
+        }
+        return Array.from(next);
+      });
+      setItems((s) => s.map((it) => (it.id === itemId ? { ...it, bookmarked: !json.removed } : it)));
     } catch (err) {
       console.error(err);
+      setBookmarkError(err instanceof Error ? err.message : 'Failed to update bookmark');
     }
   }
 
@@ -189,15 +347,6 @@ const loadMore = useCallback(async () => {
     }
   }
 
-  async function getAuthToken(): Promise<string> {
-    try {
-      const r = await fetch('/api/auth/session');
-      if (!r.ok) return '';
-      const j = await r.json();
-      return j.access_token ?? '';
-    } catch { return ''; }
-  }
-
   return (
     <div ref={containerRef} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} style={{ background: scheme.bg, color: scheme.text, minHeight: '100vh', transition: 'background 0.2s' }}>
       {/* Pull-to-refresh indicator */}
@@ -208,6 +357,12 @@ const loadMore = useCallback(async () => {
         <h1 style={{margin:0, fontSize:'18px'}}>Intelligence Feed</h1>
         <button onClick={()=>setDarkMode(!darkMode)} style={{background:'transparent', border:'none', cursor:'pointer', fontSize:'18px'}}>{darkMode ? '☀️' : '🌙'}</button>
       </div>
+
+      {bookmarkError ? (
+        <div style={{padding:'10px 16px', color:'#b91c1c', background:'rgba(185,28,28,0.08)', borderBottom:`1px solid ${scheme.border}`, fontSize:12}}>
+          {bookmarkError}
+        </div>
+      ) : null}
 
       {/* Search bar */}
       <div style={{padding:'12px 16px', borderBottom:`1px solid ${scheme.border}`, background: scheme.card}}>
@@ -235,8 +390,8 @@ const loadMore = useCallback(async () => {
 
       {/* Feed cards */}
       <div style={{padding:'12px 16px'}}>
-        {items.map((it, idx) => (
-          <FeedCard key={`${it.id}-${idx}`} item={it} scheme={scheme} onBookmark={()=>toggleBookmark(it.id)} onCopy={()=>copySummary(it.id, it.summary)} onShare={()=>shareItem(it)} isAnimating={bookmarkAnimation === it.id} copyFeedback={copyFeedback === it.id} />
+        {items.map((it) => (
+          <FeedCard key={it.id} item={it} scheme={scheme} onBookmark={()=>toggleBookmark(it.id)} onCopy={()=>copySummary(it.id, it.summary)} onShare={()=>shareItem(it)} isAnimating={bookmarkAnimation === it.id} copyFeedback={copyFeedback === it.id} />
         ))}
         {loading && (
           <div>
@@ -254,9 +409,38 @@ const loadMore = useCallback(async () => {
   );
 }
 
-function FeedCard({ item, scheme, onBookmark, onCopy, onShare, isAnimating, copyFeedback }: { item: FeedItem; scheme: any; onBookmark: ()=>void; onCopy: ()=>void; onShare: ()=>void; isAnimating: boolean; copyFeedback: boolean }) {
+function FeedCard({
+  item,
+  scheme,
+  onBookmark,
+  onCopy,
+  onShare,
+  isAnimating,
+  copyFeedback
+}: {
+  item: FeedItem;
+  scheme: {
+    bg: string;
+    text: string;
+    border: string;
+    card: string;
+    textMuted: string;
+  };
+  onBookmark: ()=>void;
+  onCopy: ()=>void;
+  onShare: ()=>void;
+  isAnimating: boolean;
+  copyFeedback: boolean | null;
+}) {
   const [showRelated, setShowRelated] = useState(false);
-  const [relatedData, setRelatedData] = useState<any>(null);
+ const [relatedData, setRelatedData] = useState<{
+  stories?: Array<{
+    id: string;
+    title: string;
+  }>;
+  sectors?: string[];
+  themes?: string[];
+} | null>(null);
 
   useEffect(() => {
     if (!showRelated) return;
@@ -288,7 +472,7 @@ function FeedCard({ item, scheme, onBookmark, onCopy, onShare, isAnimating, copy
 
       {/* Metadata and signal badge */}
       <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12, gap:8, flexWrap:'wrap'}}>
-        <div style={{fontSize:'12px', color:scheme.textMuted}}>{item.source ?? 'Unknown'} · {new Date(item.published_at ?? Date.now()).toLocaleDateString()}</div>
+        <div style={{fontSize:'12px', color:scheme.textMuted}}>{item.source ?? 'Unknown'} · {new Date(item.published_at ?? "1970-01-01T00:00:00Z").toLocaleDateString()}</div>
         {item.confidence_signal && <span style={{fontSize:'11px', color:(signalColors as Record<string,string>)[item.confidence_signal as string], fontWeight:'bold'}}>{item.confidence_signal}</span>}
       </div>
 
@@ -346,7 +530,7 @@ function FeedCard({ item, scheme, onBookmark, onCopy, onShare, isAnimating, copy
           {relatedData.stories && relatedData.stories.length > 0 && (
             <div style={{marginBottom:8}}>
               <div style={{color:scheme.textMuted, fontSize:'11px'}}>Related Stories:</div>
-              {relatedData.stories.map((s: any) => (
+              {relatedData.stories.map((s) => (
                 <div key={s.id} style={{fontSize:'12px', marginTop:4}}>• {s.title.slice(0, 60)}...</div>
               ))}
             </div>
@@ -390,8 +574,25 @@ function FeedCard({ item, scheme, onBookmark, onCopy, onShare, isAnimating, copy
   );
 }
 
-function RelatedAllocation({ clusterId, scheme }: { clusterId: string; scheme: any }) {
-  const [data, setData] = useState<any | null>(null);
+function RelatedAllocation({
+  clusterId,
+  scheme
+}: {
+  clusterId: string;
+  scheme: {
+    bg: string;
+    text: string;
+    border: string;
+    card: string;
+    textMuted: string;
+  };
+}) {
+  const [data, setData] = useState<{
+  cluster?: {
+    title?: string;
+    summary?: string;
+  };
+} | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(()=>{

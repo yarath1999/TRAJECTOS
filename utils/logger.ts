@@ -2,11 +2,43 @@ import { getPerformanceContext } from "./performanceTracker";
 
 export type LogLevel = "INFO" | "WARN" | "ERROR" | "DEBUG";
 
+const REDACTED = "[REDACTED]";
+const SENSITIVE_KEY_PATTERN = /authorization|auth[-_]?header|token|secret|password|api[-_]?key|cookie|set-cookie/i;
+
+function redactValue(value: unknown, keyPath = "", seen = new WeakSet<object>()): unknown {
+  if (keyPath && SENSITIVE_KEY_PATTERN.test(keyPath)) {
+    return REDACTED;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactValue(entry, "", seen));
+  }
+
+  if (value && typeof value === "object") {
+    if (seen.has(value as object)) {
+      return "[CIRCULAR]";
+    }
+    seen.add(value as object);
+
+    const input = value as Record<string, unknown>;
+    const output: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(input)) {
+      output[key] = redactValue(entry, key, seen);
+    }
+    return output;
+  }
+
+  return value;
+}
+
 function timestamp(): string {
   return new Date().toISOString();
 }
 
-function humanSummary(event: string, payload: any): string {
+function humanSummary(
+  event: string,
+  payload: Record<string, unknown>
+): string {
   const correlationId = payload?.correlation_id ?? payload?.correlationId ?? null;
   const runId = payload?.run_id ?? payload?.runId ?? null;
   const cluster = payload?.cluster_id ?? payload?.clusterId ?? null;
@@ -27,9 +59,9 @@ function humanSummary(event: string, payload: any): string {
   return parts.join(" ");
 }
 
-export function logEvent(event: string, payload: Record<string, any> = {}, level: LogLevel = "INFO") {
+export function logEvent(event: string, payload: Record<string, unknown> = {}, level: LogLevel = "INFO") {
   const context = getPerformanceContext();
-  const logPayload = { ...context, ...payload };
+  const logPayload = redactValue({ ...context, ...payload }) as Record<string, unknown>;
   const logObj = {
     timestamp: timestamp(),
     level,
@@ -41,7 +73,7 @@ export function logEvent(event: string, payload: Record<string, any> = {}, level
   try {
     console.log(JSON.stringify(logObj));
   } catch {
-    console.log("[LOG_PARSE_ERROR]", event, payload);
+    console.error("[LOG_PARSE_ERROR]", { event });
   }
 
   // Secondary human-friendly one-line summary for quick reading
@@ -55,14 +87,17 @@ export function logEvent(event: string, payload: Record<string, any> = {}, level
   }
 }
 
-export function logError(event: string, payload: Record<string, any> = {}) {
+export function logError(event: string, payload: Record<string, unknown> = {}) {
   logEvent(event, payload, "ERROR");
 }
 
-export function logWarn(event: string, payload: Record<string, any> = {}) {
+export function logWarn(event: string, payload: Record<string, unknown> = {}) {
   logEvent(event, payload, "WARN");
 }
 
-export function logDebug(event: string, payload: Record<string, any> = {}) {
+export function logDebug(event: string, payload: Record<string, unknown> = {}) {
+  if (process.env.NODE_ENV !== "development") {
+    return;
+  }
   logEvent(event, payload, "DEBUG");
 }
